@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>M10Modbus</RootNamespace>
+    <AssemblyName>M10Modbus.Core</AssemblyName>
+  </PropertyGroup>
+
+</Project>

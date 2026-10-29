@@ -6,6 +6,15 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Core/**;tests/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="Core/M10Modbus.Core.csproj" />
+  </ItemGroup>
 
 </Project>
