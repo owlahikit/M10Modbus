@@ -41,6 +41,7 @@ namespace M10Modbus
         private string _connectionError = "";
         private string _weightText = "—";
         private bool _weightIsMessage;
+        private bool _waitingForUnrounded;
         private Tone _weightTone = Tone.Stale;
         private string _stateText = "";
         private Tone _stateTone = Tone.Neutral;
@@ -55,6 +56,10 @@ namespace M10Modbus
 
         /// <summary>Digits after the decimal point; −1 = auto (by d). Applied from the next response.</summary>
         public int Digits { get; set; } = -1;
+
+        public bool DisplayUnrounded { get; set; }
+
+        public bool NeedsUnrounded => DisplayUnrounded || Digits >= 0;
 
         public CardPhase Phase { get; private set; } = CardPhase.Off;
 
@@ -74,6 +79,7 @@ namespace M10Modbus
             _settings = s;
             Endpoint = M10ModbusClient.FormatEndpoint(s.Ip.Trim(), s.Port);
             Digits = s.Digits ?? -1;
+            DisplayUnrounded = s.ReadUnrounded;
             _latchEnabled = latchEnabled; _latched = false; _rechecking = false;
             _faults = _clean = _failures = 0; _heldMask = 0;
             _ok = _errors = 0; _lastSuccess = null; _lastEventKey = ""; _overrun = false;
@@ -129,26 +135,29 @@ namespace M10Modbus
                     Event("Период снова выдерживается.", Tone.Neutral);
             }
 
-            bool invalid = r.HasScaleError || !r.HasValidWeight || r.UnroundedError.Length > 0;
-            string eventKey = $"{r.ErrorCode}/{r.StatusMask}/{r.HasValidWeight}/{r.UnroundedError}";
+            string unroundedError = NeedsUnrounded ? r.UnroundedError : "";
+            bool invalid = r.HasScaleError || !r.HasValidWeight || unroundedError.Length > 0;
+            string eventKey = $"{r.ErrorCode}/{r.StatusMask}/{r.HasValidWeight}/{unroundedError}";
             if (_lastEventKey != eventKey)
             {
                 _lastEventKey = eventKey;
                 Event(r.HasScaleError ? r.GetMetrologicalErrorDescription()
-                    : r.UnroundedError.Length > 0 ? r.UnroundedError
+                    : unroundedError.Length > 0 ? unroundedError
                     : !r.HasValidWeight ? "Некорректное числовое значение или дискретность d."
                     : $"{(r.IsStable ? "Стабильно" : "Не стабильно")}; {(r.IsBelowMinimum ? "вес ниже Min1" : "вес не ниже Min1")}; ноль: {YesNo(r.IsZero)}.",
                     invalid ? Tone.Bad : Tone.Neutral);
             }
 
             ApplyWeight(r, Event);
-            _snapshot = new Snapshot(_weightText, _weightIsMessage, _stateText, r.Timestamp);
+            if (!_waitingForUnrounded)
+                _snapshot = new Snapshot(_weightText, _weightIsMessage, _stateText, r.Timestamp);
             View = BuildView();
             return events;
         }
 
         private void ApplyWeight(M10PollResult r, Action<string, Tone> Event)
         {
+            _waitingForUnrounded = false;
             if (r.HasScaleError)
             {
                 _clean = 0;
@@ -163,7 +172,7 @@ namespace M10Modbus
                 ShowMessage("Некорректные данные", Tone.Bad, "Числовые значения или дискретность d недопустимы — см. HEX/расшифровку");
                 return;
             }
-            if (_settings.ReadUnrounded && !r.BruttoUnrounded.HasValue)
+            if (NeedsUnrounded && !r.BruttoUnrounded.HasValue && r.UnroundedError.Length > 0)
             {
                 _clean = 0;
                 ShowMessage("Некорректные данные", Tone.Bad, $"{r.UnroundedError} · округлённое брутто — в расшифровке журнала");
@@ -185,16 +194,31 @@ namespace M10Modbus
                 _faults = _clean = 0; _heldMask = 0; _rechecking = false;
                 Event("Проверка завершена: 12 последовательных корректных ответов.", Tone.Good);
             }
+            if (NeedsUnrounded && !r.BruttoUnrounded.HasValue)
+            {
+                _waitingForUnrounded = true;
+                ShowMessage("Ожидание точных данных", Tone.Warn, "Ожидание брутто без округления в следующем ответе");
+                return;
+            }
 
-            string weight = _settings.ReadUnrounded ? r.BruttoUnrounded!.Value.ToString("G9", CultureInfo.CurrentCulture)
+            string weight = DisplayUnrounded ? r.BruttoUnrounded!.Value.ToString("G9", CultureInfo.CurrentCulture)
                 : Digits < 0 ? r.FormatWeight(r.Brutto)
-                : r.Brutto.ToString("F" + Digits.ToString(CultureInfo.InvariantCulture), CultureInfo.CurrentCulture);
+                : FormatRounded(r.BruttoUnrounded!.Value, Digits);
             bool accountable = r.IsStable && !r.IsBelowMinimum;
             Tone tone = accountable ? Tone.Good : Tone.Warn;
             string state = r.IsBelowMinimum ? "Ниже Min1 · не подлежит учёту" : r.IsStable ? "Стабильно" : "Не стабильно · не подлежит учёту";
             _weightText = weight + " " + r.Unit; _weightIsMessage = false; _weightTone = tone;
             _stateText = $"{state} · Нетто {r.FormatWeight(r.Netto)} · Тара {r.FormatWeight(r.Tare)} {r.Unit} · Ноль: {YesNo(r.IsZero)}";
             _stateTone = tone;
+        }
+
+        private static string FormatRounded(float value, int digits)
+        {
+            string format = "F" + digits.ToString(CultureInfo.InvariantCulture);
+            string roundTrip = value.ToString("R", CultureInfo.InvariantCulture);
+            return decimal.TryParse(roundTrip, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal exact)
+                ? decimal.Round(exact, digits, MidpointRounding.AwayFromZero).ToString(format, CultureInfo.CurrentCulture)
+                : value.ToString(format, CultureInfo.CurrentCulture);
         }
 
         /// <summary>Local only: clears the latch and starts the 12-response recheck. Nothing is sent to the device.</summary>

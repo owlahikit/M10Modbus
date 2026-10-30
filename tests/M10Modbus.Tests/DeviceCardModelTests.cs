@@ -216,6 +216,7 @@ public class DeviceCardModelTests
 
         m.Digits = 2;
         var r = Ok(T0.AddSeconds(1));
+        r.BruttoUnrounded = 1234.5f;
         m.Apply(r);
         Assert.Equal(1234.5f.ToString("F2", CultureInfo.CurrentCulture) + " кг", m.View.WeightText);
 
@@ -227,6 +228,132 @@ public class DeviceCardModelTests
         var good = Ok(T0.AddSeconds(1)); good.BruttoUnrounded = 1234.56f;
         u.Apply(good);
         Assert.Equal(1234.56f.ToString("G9", CultureInfo.CurrentCulture) + " кг", u.View.WeightText);
+    }
+
+    [Theory]
+    [InlineData(0, "0")]
+    [InlineData(1, "0.5")]
+    [InlineData(2, "0.48")]
+    [InlineData(3, "0.475")]
+    [InlineData(4, "0.4750")]
+    [InlineData(5, "0.47500")]
+    [InlineData(6, "0.475002")]
+    [InlineData(7, "0.4750015")]
+    [InlineData(8, "0.47500150")]
+    public void ManualDigits_RoundUnroundedWeight(int digits, string expected)
+    {
+        var m = Started(latch: false);
+        m.Digits = digits;
+        var r = Ok(T0);
+        r.Brutto = 0.48f;
+        r.BruttoUnrounded = 0.4750015f;
+        r.Unit = "т";
+        m.Apply(r);
+        Assert.True(m.NeedsUnrounded);
+        Assert.Equal(expected.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " т", m.View.WeightText);
+
+        if (digits >= 4)
+        {
+            r.BruttoUnrounded = 0.4740019f;
+            m.Apply(r);
+            Assert.NotEqual(expected.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " т", m.View.WeightText);
+        }
+    }
+
+    [Theory]
+    [InlineData(2.5f, "3")]
+    [InlineData(-2.5f, "-3")]
+    public void ManualDigits_MidpointsRoundAwayFromZero(float raw, string expected)
+    {
+        var m = Started(latch: false);
+        m.Digits = 0;
+        var r = Ok(T0);
+        r.BruttoUnrounded = raw;
+        m.Apply(r);
+        Assert.Equal(expected + " кг", m.View.WeightText);
+    }
+
+    [Fact]
+    public void DisplayModeChanges_ApplyToFollowingResponses_AndPreserveLastSnapshot()
+    {
+        var m = Started(latch: false);
+        var r = Ok(T0);
+        r.Brutto = 0.48f;
+        r.Unit = "т";
+        Assert.False(m.NeedsUnrounded);
+        m.Apply(r);
+        string original = m.View.WeightText;
+
+        m.Digits = 7;
+        Assert.True(m.NeedsUnrounded);
+        m.Apply(r); // An already in-flight 13-register response.
+        Assert.Equal("Ожидание точных данных", m.View.WeightText);
+        m.Stop(T0.AddSeconds(1), "оператором");
+        Assert.Equal(original, m.View.WeightText);
+        Assert.Equal(Tone.Stale, m.View.WeightTone);
+
+        m.Start(Settings(), false, T0.AddSeconds(2));
+        m.Digits = 7;
+        r.BruttoUnrounded = 0.4750015f;
+        m.Apply(r);
+        string rounded = "0.4750015".Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " т";
+        Assert.Equal(rounded, m.View.WeightText);
+
+        m.DisplayUnrounded = true;
+        m.Apply(r);
+        Assert.Equal(r.BruttoUnrounded.Value.ToString("G9", CultureInfo.CurrentCulture) + " т", m.View.WeightText);
+        m.DisplayUnrounded = false;
+        m.Apply(r);
+        Assert.Equal(rounded, m.View.WeightText);
+        m.Digits = -1;
+        Assert.False(m.NeedsUnrounded);
+        r.BruttoUnrounded = null;
+        m.Apply(r);
+        Assert.Equal(original, m.View.WeightText);
+
+        m.DisplayUnrounded = true;
+        Assert.True(m.NeedsUnrounded);
+        m.Apply(r);
+        Assert.Equal("Ожидание точных данных", m.View.WeightText);
+        m.DisplayUnrounded = false;
+        Assert.False(m.NeedsUnrounded);
+        m.Apply(r);
+        Assert.Equal(original, m.View.WeightText);
+    }
+
+    [Fact]
+    public void DisplayModeChange_DoesNotHideLatchedError()
+    {
+        var m = Started();
+        for (int i = 0; i < 3; i++) m.Apply(Ok(T0.AddSeconds(i), error: 2));
+        m.DisplayUnrounded = true;
+        m.Apply(Ok(T0.AddSeconds(3)));
+        Assert.Equal("Фиксация 0x0002", m.View.WeightText);
+        Assert.True(m.View.ShowLatchReset);
+    }
+
+    [Fact]
+    public void ManualDigits_HandlesLargeFiniteWeight()
+    {
+        var m = Started(latch: false);
+        m.Digits = 8;
+        var r = Ok(T0);
+        r.BruttoUnrounded = float.MaxValue;
+        m.Apply(r);
+        Assert.False(m.View.WeightIsMessage);
+        Assert.EndsWith(" кг", m.View.WeightText);
+    }
+
+    [Fact]
+    public void InvalidUnrounded_IsNotReplacedByRoundedWeight()
+    {
+        var m = Started(latch: false);
+        m.Digits = 5;
+        var r = Ok(T0);
+        r.UnroundedError = "Брутто без округления: NaN/Infinity";
+        m.Apply(r);
+        Assert.Equal("Некорректные данные", m.View.WeightText);
+        Assert.Equal(Tone.Bad, m.View.WeightTone);
     }
 
     [Fact]

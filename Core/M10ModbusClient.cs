@@ -177,7 +177,10 @@ namespace M10Modbus
 
         public Task<M10PollResult> PollAsync(CancellationToken ct = default) => PollAsync(PollSlot.Immediate, ct);
 
-        public async Task<M10PollResult> PollAsync(PollSlot slot, CancellationToken ct = default)
+        public Task<M10PollResult> PollAsync(PollSlot slot, CancellationToken ct = default) =>
+            PollAsync(slot, ReadUnrounded, ct);
+
+        public async Task<M10PollResult> PollAsync(PollSlot slot, bool readUnrounded, CancellationToken ct = default)
         {
             await _gate.WaitAsync(ct).ConfigureAwait(false);
             var timer = Stopwatch.StartNew();
@@ -189,14 +192,14 @@ namespace M10Modbus
                 ct.ThrowIfCancellationRequested();
                 if (!IsConnected) { result.Reinitialized = true; await ConnectCoreAsync(ct).ConfigureAwait(false); }
                 if (!_initialized) { result.Reinitialized = true; await InitializeAsync(ct).ConfigureAwait(false); }
-                ushort[] words = await ReadHoldingRegistersAsync(CurrentAddress, ReadUnrounded ? (ushort)15 : CurrentRegisterCount,
+                ushort[] words = await ReadHoldingRegistersAsync(CurrentAddress, readUnrounded ? (ushort)15 : CurrentRegisterCount,
                     TracePhase.Poll, slot, exchange, ct).ConfigureAwait(false);
                 result.Timestamp = exchange.RxTime;
                 result.MeasurementUnixTime = ReadUInt32(words, 0);
                 result.ErrorCode = words[2]; result.StatusMask = words[3]; result.Range = words[4];
                 result.Division = ReadFloat(words, 5); result.Brutto = ReadFloat(words, 7);
                 result.Netto = ReadFloat(words, 9); result.Tare = ReadFloat(words, 11);
-                if (ReadUnrounded)
+                if (readUnrounded)
                 {
                     float unrounded = ReadFloat(words, 13);
                     if (float.IsFinite(unrounded)) result.BruttoUnrounded = unrounded;

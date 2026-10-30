@@ -31,6 +31,7 @@ namespace M10Modbus
             public Task? Worker;
             public IDisposable? TimerRes;
             public Task? Stopping;
+            public int NeedsUnrounded;
             /// <summary>Incremented on every start/stop; results of a finished polling session are dropped.</summary>
             public int Generation;
             public bool Running => Cts != null;
@@ -95,7 +96,9 @@ namespace M10Modbus
                 DeviceRunner r = runner;
                 r.Panel.PollToggled += (_, _) => OnPollToggled(r);
                 r.Panel.ResetRequested += (_, _) => ApplyEvents(r, r.Model.ResetLatch(DateTime.Now));
-                r.Panel.DigitsChanged += (_, _) => r.Model.Digits = r.Panel.Digits;
+                r.Panel.DigitsChanged += (_, _) => UpdateWeightMode(r);
+                r.Panel.UnroundedChanged += (_, _) => UpdateWeightMode(r);
+                UpdateWeightMode(r);
                 r.Panel.Render(r.Model.View);
             }
             _period.ValueChanged += (_, _) => Volatile.Write(ref _periodMs, (int)_period.Value);
@@ -328,6 +331,13 @@ namespace M10Modbus
             else _ = StopFromUiAsync(r, "оператором");
         }
 
+        private static void UpdateWeightMode(DeviceRunner r)
+        {
+            r.Model.Digits = r.Panel.Digits;
+            r.Model.DisplayUnrounded = r.Panel.ReadUnrounded;
+            Volatile.Write(ref r.NeedsUnrounded, r.Model.NeedsUnrounded ? 1 : 0);
+        }
+
         private void SetChecked(DeviceRunner r, bool value)
         {
             _suppressToggle = true;
@@ -355,11 +365,12 @@ namespace M10Modbus
             panel.LockSettings(true);
             r.Generation++;
             ApplyEvents(r, r.Model.Start(settings, _latch.Checked, DateTime.Now, (int)_period.Value, (int)_timeout.Value));
+            UpdateWeightMode(r);
             r.TimerRes = TimerResolution.Acquire();
             r.Cts = new CancellationTokenSource();
-            int device = r.Number, generation = r.Generation;
+            int generation = r.Generation;
             CancellationToken token = r.Cts.Token;
-            r.Worker = Task.Run(() => RunDeviceAsync(device, settings, generation, token));
+            r.Worker = Task.Run(() => RunDeviceAsync(r, settings, generation, token));
             _ = ObserveWorkerAsync(r, r.Worker);
             UpdateRunState();
         }
@@ -428,8 +439,9 @@ namespace M10Modbus
         }
 
         /// <summary>Runs on the thread pool; touches the UI only through <see cref="Post"/>.</summary>
-        private async Task RunDeviceAsync(int device, DeviceSettings s, int generation, CancellationToken ct)
+        private async Task RunDeviceAsync(DeviceRunner runner, DeviceSettings s, int generation, CancellationToken ct)
         {
+            int device = runner.Number;
             using var client = new M10ModbusClient(s.Ip.Trim(), s.Port, (byte)s.UnitId, s.Scale, s.ReadUnrounded);
             client.Trace += trace => Post(() => AddTrace(device, trace));
             var scheduler = new PollScheduler(Stopwatch.GetTimestamp, Stopwatch.Frequency, Task.Delay);
@@ -443,7 +455,8 @@ namespace M10Modbus
                     scheduler.Period = TimeSpan.FromMilliseconds(period);
                     PollSlotPlan plan = scheduler.NextSlot();
                     await scheduler.WaitAsync(plan, ct);
-                    M10PollResult result = await client.PollAsync(new PollSlot(period, plan.Overrun), ct);
+                    bool readUnrounded = Volatile.Read(ref runner.NeedsUnrounded) != 0;
+                    M10PollResult result = await client.PollAsync(new PollSlot(period, plan.Overrun), readUnrounded, ct);
                     ct.ThrowIfCancellationRequested();
                     Post(() => ApplyResult(device, generation, result));
                     if (result.IsConnected)
@@ -603,9 +616,10 @@ namespace M10Modbus
             if (_log.TextLength > 400000)
             {
                 string visible = _log.Text;
-                int cut = visible.IndexOf('\n', 100000) + 1;
+                int lineEnd = visible.IndexOf('\n', 100000);
+                int cut = lineEnd >= 0 ? lineEnd + 1 : 100000;
                 int removedLines = visible.Take(cut).Count(c => c == '\n');
-                _log.Select(0, cut); _log.SelectedText = "";
+                LogTextBox.RemovePrefix(_log, cut);
                 selection = Math.Max(0, selection - cut);
                 length = Math.Min(length, _log.TextLength - selection);
                 firstLine = Math.Max(0, firstLine - removedLines);
@@ -776,6 +790,7 @@ namespace M10Modbus
         public event EventHandler? PollToggled;
         public event EventHandler? ResetRequested;
         public event EventHandler? DigitsChanged;
+        public event EventHandler? UnroundedChanged;
 
         public int DeviceNumber { get; }
         public string IpAddress => _ip.Text.Trim();
@@ -784,6 +799,7 @@ namespace M10Modbus
         public int ScaleNumber => _scale.SelectedIndex + 1;
         /// <summary>Digits after the decimal point; −1 = auto.</summary>
         public int Digits => _digits.SelectedIndex - 1;
+        public bool ReadUnrounded => _raw.Checked;
         public string ConnectionKey => $"{IpAddress}:{Port}/{UnitId}/{ScaleNumber}";
         public bool PollChecked { get => _poll.Checked; set => _poll.Checked = value; }
 
@@ -815,18 +831,23 @@ namespace M10Modbus
             settings.Controls.Add(MainForm.Group(digitsLabel, _digits));
 
             _tips.SetToolTip(_poll, "Включить/выключить опрос этого прибора. Второй прибор не затрагивается. " +
-                "Пока опрос включён, IP, порт, Id, весы и «Без округления» не редактируются.");
+                "Пока опрос включён, IP, порт, Id и весы не редактируются.");
             string uidTip = "Unit Identifier — адрес устройства в запросе Modbus TCP (7-й байт MBAP), та же роль, что адрес в Modbus RTU. " +
                 "Должен совпадать с настройкой прибора.";
             _tips.SetToolTip(uidLabel, uidTip); _tips.SetToolTip(_uid, uidTip);
             string scaleTip = "Номер весов 1–3: текущие показания читаются с адреса 2000+33·(n−1), конфигурация — 1100+33·(n−1).";
             _tips.SetToolTip(scaleLabel, scaleTip); _tips.SetToolTip(_scale, scaleTip);
-            _tips.SetToolTip(_raw, "Читать 15 регистров вместо 13: дополнительно брутто без округления (2013+33·(n−1)).");
-            string digitsTip = "Число знаков после запятой на экране. Применяется сразу.";
+            _tips.SetToolTip(_raw, "Показывать брутто без округления прибора (2013+33·(n−1)). Применяется со следующего запроса.");
+            string digitsTip = "Авто: округлённое прибором брутто по дискретности d. При выборе числа знаков " +
+                "брутто без округления округляется до этого числа; это не метрологическое округление прибора. Применяется со следующего запроса.";
             _tips.SetToolTip(digitsLabel, digitsTip); _tips.SetToolTip(_digits, digitsTip);
 
             _poll.CheckedChanged += (_, _) => PollToggled?.Invoke(this, EventArgs.Empty);
-            _raw.CheckedChanged += (_, _) => _digits.Enabled = !_raw.Checked;
+            _raw.CheckedChanged += (_, _) =>
+            {
+                _digits.Enabled = !_raw.Checked;
+                UnroundedChanged?.Invoke(this, EventArgs.Empty);
+            };
             _digits.SelectedIndexChanged += (_, _) => DigitsChanged?.Invoke(this, EventArgs.Empty);
 
             _status.Font = new Font(Font, FontStyle.Bold);
@@ -876,10 +897,10 @@ namespace M10Modbus
             _ip.Focus(); _ip.SelectAll(); return false;
         }
 
-        /// <summary>Locks the connection settings; «Опрос» and «Знаков» stay available.</summary>
+        /// <summary>Locks connection settings while display settings remain available.</summary>
         public void LockSettings(bool locked)
         {
-            _ip.Enabled = _port.Enabled = _uid.Enabled = _scale.Enabled = _raw.Enabled = !locked;
+            _ip.Enabled = _port.Enabled = _uid.Enabled = _scale.Enabled = !locked;
         }
 
         public void SetToggleEnabled(bool enabled) => _poll.Enabled = enabled;
@@ -929,7 +950,7 @@ namespace M10Modbus
 
         private void AppendHistory(CardEvent e)
         {
-            if (_history.TextLength > 20000) { _history.Select(0, 5000); _history.SelectedText = ""; }
+            if (_history.TextLength > 20000) LogTextBox.RemovePrefix(_history, 5000);
             _history.Select(_history.TextLength, 0); _history.SelectionColor = MainForm.ToneColor(e.Tone);
             _history.AppendText(e.Time.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + e.Text + Environment.NewLine);
             NativeLogScroll.ToBottom(_history);
@@ -960,6 +981,24 @@ namespace M10Modbus
         {
             if (disposing) { _tips.Dispose(); _weightFont.Dispose(); _messageFont.Dispose(); }
             base.Dispose(disposing);
+        }
+    }
+
+    internal static class LogTextBox
+    {
+        public static void RemovePrefix(RichTextBox box, int length)
+        {
+            bool readOnly = box.ReadOnly;
+            try
+            {
+                box.ReadOnly = false;
+                box.Select(0, length);
+                box.SelectedText = "";
+            }
+            finally
+            {
+                box.ReadOnly = readOnly;
+            }
         }
     }
 
