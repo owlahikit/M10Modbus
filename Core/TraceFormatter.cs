@@ -106,14 +106,65 @@ namespace M10Modbus
         {
             string prefix = Prefix(r.Timestamp, device);
             if (!r.IsConnected) return (prefix + "Ошибка обмена: " + r.ConnectionError, true);
-            string text = prefix + $"Данные №{r.TransactionId} · Весы {r.ScaleNumber} | Errors=0x{r.ErrorCode:X4}: {r.GetMetrologicalErrorDescription()} | " +
-                $"Status=0x{r.StatusMask:X4} | Stable={(r.IsStable ? 1 : 0)} Zero={(r.IsZero ? 1 : 0)} BelowMin={(r.IsBelowMinimum ? 1 : 0)} | " +
+            string text = $"{r.TransactionId}: {prefix}Весы {r.ScaleNumber}: " +
                 $"Брутто={r.Brutto.ToString("G9", Inv)} Нетто={r.Netto.ToString("G9", Inv)} " +
-                $"Тара={r.Tare.ToString("G9", Inv)} {r.Unit} | d={r.Division.ToString("G9", Inv)} | " +
-                $"Диапазон={r.Range} DT_LastWeight={r.MeasurementUnixTime}" +
-                (r.BruttoUnrounded.HasValue ? $" | Брутто без округления={r.BruttoUnrounded.Value.ToString("G9", Inv)} {r.Unit}" : "") +
-                (r.UnroundedError.Length > 0 ? " | " + r.UnroundedError : "");
-            return (text, r.HasScaleError || !r.HasValidWeight || r.UnroundedError.Length > 0);
+                $"Тара={r.Tare.ToString("G9", Inv)} {r.Unit} d={r.Division.ToString("G9", Inv)} | " +
+                $"Диапазон={r.Range} | Stable={(r.IsStable ? 1 : 0)} Zero={(r.IsZero ? 1 : 0)} " +
+                $"BelowMin={(r.IsBelowMinimum ? 1 : 0)} | {r.GetMetrologicalErrorDescription()}";
+            return (text, r.HasScaleError || !r.HasValidWeight);
+        }
+
+        public static (string Text, bool IsError)? FormatInitializationData(ModbusTrace t, int device)
+        {
+            if (t.Direction != "RX" || t.Phase == TracePhase.Poll || !t.IsComplete || t.Note.Length > 0)
+                return null;
+            int count = t.Phase == TracePhase.Identification ? 9 : 22;
+            byte[] b = t.Bytes;
+            if (t.RegisterCount != count || b.Length != 9 + 2 * count ||
+                b[7] != 3 || b[8] != 2 * count || b[6] != t.UnitId ||
+                ((b[0] << 8) | b[1]) != t.TransactionId || b[2] != 0 || b[3] != 0 ||
+                ((b[4] << 8) | b[5]) != b.Length - 6)
+                return null;
+            var words = new ushort[count];
+            for (int i = 0; i < count; i++) words[i] = (ushort)((b[9 + 2 * i] << 8) | b[10 + 2 * i]);
+            string prefix = Prefix(t.Timestamp, device);
+            if (t.Phase == TracePhase.Identification)
+            {
+                string text = prefix + $"Идентификация №{t.TransactionId} | Тип={words[0]} ({(words[0] == 100 ? "M10" : "неизвестный")}) | SN={words[1]}";
+                if (words[8] > 1)
+                    return (text + $" | Endians={words[8]}: неизвестный порядок слов, FW и DT не расшифрованы", true);
+                bool lowWordFirst = words[8] == 1;
+                uint firmware = M10ModbusClient.DecodeUInt32(words, 2, lowWordFirst);
+                text += $" | FW={firmware >> 16}.{firmware & 0xFFFF:D3}" +
+                    $" | DT_Current={M10ModbusClient.DecodeUInt32(words, 4, lowWordFirst)} | DT_Boot={M10ModbusClient.DecodeUInt32(words, 6, lowWordFirst)}" +
+                    $" | Endians={words[8]} ({(lowWordFirst ? "младшее" : "старшее")} слово первым)";
+                bool invalid = words[0] != 100 || (firmware >> 16) != 1;
+                return (text + (invalid ? " | НЕКОРРЕКТНО: неподдерживаемый тип или версия протокола" : ""), invalid);
+            }
+
+            string unit = words[1] switch { 0 => "кг", 1 => "т", _ => "неизвестная" };
+            string rangeType = words[2] switch
+            {
+                0 => "однодиапазонные", 1 => "многоинтервальные", 2 => "многодиапазонные", _ => "неизвестный"
+            };
+            var config = new StringBuilder(prefix + $"Конфигурация №{t.TransactionId} · Весы {t.ScaleNumber}" +
+                $" | SN весов={words[0]} | Единица={words[1]} ({unit}) | Тип диапазонов={words[2]} ({rangeType}) | Диапазонов={words[3]}");
+            bool invalidConfig = words[1] > 1 || words[2] > 2 || words[3] < 1 || words[3] > 3;
+            if (words[3] is >= 1 and <= 3)
+            {
+                for (int i = 0; i < words[3]; i++)
+                {
+                    int offset = 4 + 6 * i;
+                    float min = M10ModbusClient.DecodeFloat(words, offset, t.LowWordFirst);
+                    float max = M10ModbusClient.DecodeFloat(words, offset + 2, t.LowWordFirst);
+                    float d = M10ModbusClient.DecodeFloat(words, offset + 4, t.LowWordFirst);
+                    config.Append($" | Диапазон {i + 1}: Min={min.ToString("G9", Inv)} Max={max.ToString("G9", Inv)} d={d.ToString("G9", Inv)}");
+                    invalidConfig |= !float.IsFinite(min) || !float.IsFinite(max) || !float.IsFinite(d) ||
+                        min < 0 || max < min || d <= 0;
+                }
+            }
+            if (invalidConfig) config.Append(" | НЕКОРРЕКТНО: единица или параметры диапазонов — проверьте настройки");
+            return (config.ToString(), invalidConfig);
         }
 
         /// <summary>Device event: "HH:mm:ss.fff [Прибор N] 10.0.1.18:502 | text".</summary>

@@ -10,7 +10,33 @@ namespace M10Modbus
     public sealed record CardView(
         string StatusText, Tone StatusTone, string StatusTip,
         string WeightText, bool WeightIsMessage, Tone WeightTone,
-        string StateText, Tone StateTone, bool ShowLatchReset);
+        string StateText, Tone StateTone, bool ShowLatchReset)
+    {
+        public InstrumentView? Instrument { get; init; }
+        public bool HasFreshInstrument => StatusTone == Tone.Good && WeightTone != Tone.Stale && Instrument != null;
+        public bool HasLiveIndication => StatusTone == Tone.Good && !WeightIsMessage &&
+            WeightTone != Tone.Stale && Instrument != null;
+        public bool StableIndicator => HasLiveIndication && Instrument!.IsStable;
+        public bool ZeroIndicator => HasLiveIndication && Instrument!.IsZero;
+    }
+
+    public enum IndicatorState { Off, Green, Red }
+
+    public sealed record InstrumentRangeView(int Number, string MinimumText, string MaximumText, string DivisionText)
+    {
+        public IndicatorState Indicator { get; init; }
+    }
+
+    public sealed record InstrumentView(
+        string NettoText, string TareText, string BruttoText, string DivisionText,
+        string Unit, int ScaleNumber, ushort Range, bool IsStable, bool IsZero)
+    {
+        public IReadOnlyList<InstrumentRangeView> Ranges { get; init; } = Array.Empty<InstrumentRangeView>();
+        public IndicatorState AboveMaximumIndicator { get; init; }
+        public ushort ScaleSerialNumber { get; init; }
+        public bool IsAlarm { get; init; }
+        public bool TareIsLastKnown { get; init; }
+    }
 
     /// <summary>Card history line and EVENT journal line. Time is the moment of the event, not of rendering.</summary>
     public sealed record CardEvent(DateTime Time, string Text, Tone Tone);
@@ -22,7 +48,7 @@ namespace M10Modbus
         private const int CleanResponsesRequired = 12;
         private const int FaultsToLatch = 3;
 
-        private sealed record Snapshot(string WeightText, bool WeightIsMessage, string StateText, DateTime Time);
+        private sealed record Snapshot(string WeightText, bool WeightIsMessage, string StateText, DateTime Time, InstrumentView? Instrument);
 
         private DeviceSettings _settings = new();
         private Snapshot? _snapshot;
@@ -39,12 +65,16 @@ namespace M10Modbus
         private double _responseMs;
         private string _deviceInfo = "";
         private string _connectionError = "";
+        private bool _requiresOperatorAction;
+        private string _configurationWarning = "";
         private string _weightText = "—";
         private bool _weightIsMessage;
-        private bool _waitingForUnrounded;
         private Tone _weightTone = Tone.Stale;
         private string _stateText = "";
         private Tone _stateTone = Tone.Neutral;
+        private InstrumentView? _instrument;
+        private string? _lastValidTare;
+        private M10PollResult? _lastReading;
 
         public DeviceCardModel(int deviceNumber)
         {
@@ -53,13 +83,6 @@ namespace M10Modbus
         }
 
         public int DeviceNumber { get; }
-
-        /// <summary>Digits after the decimal point; −1 = auto (by d). Applied from the next response.</summary>
-        public int Digits { get; set; } = -1;
-
-        public bool DisplayUnrounded { get; set; }
-
-        public bool NeedsUnrounded => DisplayUnrounded || Digits >= 0;
 
         public CardPhase Phase { get; private set; } = CardPhase.Off;
 
@@ -78,17 +101,17 @@ namespace M10Modbus
         {
             _settings = s;
             Endpoint = M10ModbusClient.FormatEndpoint(s.Ip.Trim(), s.Port);
-            Digits = s.Digits ?? -1;
-            DisplayUnrounded = s.ReadUnrounded;
             _latchEnabled = latchEnabled; _latched = false; _rechecking = false;
             _faults = _clean = _failures = 0; _heldMask = 0;
             _ok = _errors = 0; _lastSuccess = null; _lastEventKey = ""; _overrun = false;
-            _deviceInfo = ""; _connectionError = "";
+            _deviceInfo = ""; _connectionError = ""; _requiresOperatorAction = false; _configurationWarning = "";
+            _lastValidTare = null;
+            _lastReading = null;
             Phase = CardPhase.Connecting;
             string timing = periodMs.HasValue && timeoutMs.HasValue ? $"; период {periodMs} мс, таймаут {timeoutMs} мс" : "";
             var events = new List<CardEvent>
             {
-                new(now, $"Опрос включён: {Endpoint}, Id {s.UnitId}, весы {s.Scale}, без округления: {YesNo(s.ReadUnrounded)}" +
+                new(now, $"Опрос включён: {Endpoint}, Id {s.UnitId}, весы {s.Scale}" +
                     $"{timing}, фиксация ошибок: {YesNo(latchEnabled)}.", Tone.Neutral)
             };
             View = BuildView();
@@ -114,8 +137,10 @@ namespace M10Modbus
             {
                 _errors++; _failures++; _clean = 0;
                 _connectionError = r.ConnectionError;
+                _requiresOperatorAction = r.RequiresOperatorAction;
                 Phase = CardPhase.CommError;
-                if (_failures == 1 || _failures % 10 == 0) Event($"Ошибка обмена #{_failures}: {r.ConnectionError}", Tone.Bad);
+                if (_failures == 1 || _failures % 10 == 0)
+                    Event($"{(r.RequiresOperatorAction ? "Опрос приостановлен" : "Ошибка обмена")} #{_failures}: {r.ConnectionError}", Tone.Bad);
                 View = BuildView();
                 return events;
             }
@@ -124,7 +149,15 @@ namespace M10Modbus
                 Event(_failures > 0 ? "Обмен восстановлен; конфигурация прочитана заново." : $"Обмен установлен; {r.DeviceInfo}.", Tone.Good);
             _failures = 0; _ok++; _lastSuccess = r.Timestamp;
             Phase = CardPhase.Live;
+            if (r.ConfigurationWarning != _configurationWarning)
+            {
+                _configurationWarning = r.ConfigurationWarning;
+                Event(_configurationWarning.Length > 0
+                    ? $"Таблица диапазонов недоступна: {_configurationWarning} Показания опрашиваются."
+                    : "Таблица диапазонов восстановлена.", _configurationWarning.Length > 0 ? Tone.Warn : Tone.Good);
+            }
             _responseTime = r.Timestamp; _responseMs = r.ResponseMs; _deviceInfo = r.DeviceInfo;
+            _lastReading = r;
 
             if (r.PeriodOverrun != _overrun)
             {
@@ -135,35 +168,32 @@ namespace M10Modbus
                     Event("Период снова выдерживается.", Tone.Neutral);
             }
 
-            string unroundedError = NeedsUnrounded ? r.UnroundedError : "";
-            bool invalid = r.HasScaleError || !r.HasValidWeight || unroundedError.Length > 0;
-            string eventKey = $"{r.ErrorCode}/{r.StatusMask}/{r.HasValidWeight}/{unroundedError}";
+            bool invalid = r.HasScaleError || !r.HasValidWeight;
+            string eventKey = $"{r.ErrorCode}/{r.StatusMask}/{r.HasValidWeight}";
             if (_lastEventKey != eventKey)
             {
                 _lastEventKey = eventKey;
                 Event(r.HasScaleError ? r.GetMetrologicalErrorDescription()
-                    : unroundedError.Length > 0 ? unroundedError
                     : !r.HasValidWeight ? "Некорректное числовое значение или дискретность d."
                     : $"{(r.IsStable ? "Стабильно" : "Не стабильно")}; {(r.IsBelowMinimum ? "вес ниже Min1" : "вес не ниже Min1")}; ноль: {YesNo(r.IsZero)}.",
                     invalid ? Tone.Bad : Tone.Neutral);
             }
 
             ApplyWeight(r, Event);
-            if (!_waitingForUnrounded)
-                _snapshot = new Snapshot(_weightText, _weightIsMessage, _stateText, r.Timestamp);
+            _snapshot = new Snapshot(_weightText, _weightIsMessage, _stateText, r.Timestamp, _instrument);
             View = BuildView();
             return events;
         }
 
         private void ApplyWeight(M10PollResult r, Action<string, Tone> Event)
         {
-            _waitingForUnrounded = false;
             if (r.HasScaleError)
             {
                 _clean = 0;
                 if (_latchEnabled) { _faults++; _heldMask |= r.ErrorCode; if (_faults >= FaultsToLatch) _latched = true; }
-                ShowMessage($"Ошибка 0x{r.ErrorCode:X4}", Tone.Bad,
+                ShowMessage("Авария", Tone.Bad,
                     $"{r.GetMetrologicalErrorDescription()} · {(_latched ? "ошибка зафиксирована — снимите фиксацию после проверки" : "вес недействителен по флагу Errors")}");
+                _instrument = BuildInstrument(r, "Авария", currentAlarm: true);
                 return;
             }
             if (!r.HasValidWeight)
@@ -172,15 +202,11 @@ namespace M10Modbus
                 ShowMessage("Некорректные данные", Tone.Bad, "Числовые значения или дискретность d недопустимы — см. HEX/расшифровку");
                 return;
             }
-            if (NeedsUnrounded && !r.BruttoUnrounded.HasValue && r.UnroundedError.Length > 0)
-            {
-                _clean = 0;
-                ShowMessage("Некорректные данные", Tone.Bad, $"{r.UnroundedError} · округлённое брутто — в расшифровке журнала");
-                return;
-            }
             if (_latched)
             {
-                ShowMessage($"Фиксация 0x{_heldMask:X4}", Tone.Warn, "Сейчас ошибок нет · предыдущая ошибка зафиксирована");
+                string text = $"Фиксация Аварии 0x{_heldMask:X4}";
+                ShowMessage(text, Tone.Warn, "Сейчас ошибок нет · предыдущая ошибка зафиксирована");
+                _instrument = BuildInstrument(r, text, heldAlarm: true);
                 return;
             }
             if (_latchEnabled && (_faults > 0 || _rechecking))
@@ -194,31 +220,72 @@ namespace M10Modbus
                 _faults = _clean = 0; _heldMask = 0; _rechecking = false;
                 Event("Проверка завершена: 12 последовательных корректных ответов.", Tone.Good);
             }
-            if (NeedsUnrounded && !r.BruttoUnrounded.HasValue)
-            {
-                _waitingForUnrounded = true;
-                ShowMessage("Ожидание точных данных", Tone.Warn, "Ожидание брутто без округления в следующем ответе");
-                return;
-            }
-
-            string weight = DisplayUnrounded ? r.BruttoUnrounded!.Value.ToString("G9", CultureInfo.CurrentCulture)
-                : Digits < 0 ? r.FormatWeight(r.Brutto)
-                : FormatRounded(r.BruttoUnrounded!.Value, Digits);
-            bool accountable = r.IsStable && !r.IsBelowMinimum;
+            string weight = r.FormatWeight(r.Brutto);
+            bool aboveMaximum = IsAboveMaximum(r);
+            bool belowMinimum = IsBelowMinimum(r);
+            bool accountable = r.IsStable && !belowMinimum && !aboveMaximum;
             Tone tone = accountable ? Tone.Good : Tone.Warn;
-            string state = r.IsBelowMinimum ? "Ниже Min1 · не подлежит учёту" : r.IsStable ? "Стабильно" : "Не стабильно · не подлежит учёту";
+            string state = belowMinimum ? "Ниже Min1 · не подлежит учёту"
+                : aboveMaximum ? "Выше Max · не подлежит учёту"
+                : r.IsStable ? "Стабильно" : "Не стабильно · не подлежит учёту";
             _weightText = weight + " " + r.Unit; _weightIsMessage = false; _weightTone = tone;
             _stateText = $"{state} · Нетто {r.FormatWeight(r.Netto)} · Тара {r.FormatWeight(r.Tare)} {r.Unit} · Ноль: {YesNo(r.IsZero)}";
             _stateTone = tone;
+            _lastValidTare = r.FormatWeight(r.Tare);
+            _instrument = BuildInstrument(r);
         }
 
-        private static string FormatRounded(float value, int digits)
+        private static bool IsBelowMinimum(M10PollResult r) => r.IsBelowMinimum || r.IsBelowThreshold ||
+            (r.HasValidWeight && r.Ranges.Count > 0 && r.Brutto < r.Ranges.MinBy(range => range.Number)!.Minimum);
+
+        private static bool IsAboveMaximum(M10PollResult r) => r.IsAboveThreshold ||
+            (r.HasValidWeight && r.Ranges.Count > 0 && r.Brutto > r.Ranges.MaxBy(range => range.Number)!.Maximum);
+
+        private InstrumentView BuildInstrument(M10PollResult r, string? alarmText = null, bool currentAlarm = false, bool heldAlarm = false)
         {
-            string format = "F" + digits.ToString(CultureInfo.InvariantCulture);
-            string roundTrip = value.ToString("R", CultureInfo.InvariantCulture);
-            return decimal.TryParse(roundTrip, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal exact)
-                ? decimal.Round(exact, digits, MidpointRounding.AwayFromZero).ToString(format, CultureInfo.CurrentCulture)
-                : value.ToString(format, CultureInfo.CurrentCulture);
+            bool below = IsBelowMinimum(r);
+            bool above = IsAboveMaximum(r);
+            int first = r.Ranges.Count > 0 ? r.Ranges.Min(range => range.Number) : 1;
+            int indicatedRange = below ? first : r.Range;
+            IndicatorState state = below ? IndicatorState.Red : currentAlarm ? IndicatorState.Off : IndicatorState.Green;
+            return new InstrumentView(heldAlarm ? $"Фиксация Аварии\n0x{_heldMask:X4}" : alarmText ?? r.FormatWeight(r.Netto),
+                alarmText != null ? _lastValidTare ?? "—" : r.FormatWeight(r.Tare),
+                alarmText != null ? "Авария" : r.FormatWeight(r.Brutto), r.FormatWeight(r.Division),
+                r.Unit, r.ScaleNumber, r.Range, r.IsStable, r.IsZero)
+            {
+                ScaleSerialNumber = r.ScaleSerialNumber,
+                AboveMaximumIndicator = !heldAlarm && above ? IndicatorState.Green : IndicatorState.Off,
+                IsAlarm = alarmText != null,
+                TareIsLastKnown = alarmText != null,
+                Ranges = r.Ranges.Select(range => new InstrumentRangeView(range.Number,
+                    r.FormatWeight(range.Minimum), r.FormatWeight(range.Maximum), r.FormatWeight(range.Division))
+                {
+                    Indicator = heldAlarm || above || range.Number != indicatedRange ? IndicatorState.Off : state
+                }).ToArray()
+            };
+        }
+
+        public IReadOnlyList<CardEvent> SetLatchEnabled(bool enabled, DateTime now)
+        {
+            if (_latchEnabled == enabled) return Array.Empty<CardEvent>();
+            _latchEnabled = enabled;
+            if (Phase == CardPhase.Off) return Array.Empty<CardEvent>();
+
+            var events = new List<CardEvent>
+            {
+                new(now, $"Фиксация ошибок {(enabled ? "включена" : "выключена")}.", Tone.Neutral)
+            };
+            if (!enabled)
+            {
+                _latched = false; _rechecking = false; _faults = _clean = 0; _heldMask = 0;
+                if (Phase == CardPhase.Live && _lastReading != null)
+                {
+                    ApplyWeight(_lastReading, (text, tone) => events.Add(new CardEvent(now, text, tone)));
+                    _snapshot = new Snapshot(_weightText, _weightIsMessage, _stateText, _lastReading.Timestamp, _instrument);
+                }
+            }
+            View = BuildView();
+            return events;
         }
 
         /// <summary>Local only: clears the latch and starts the 12-response recheck. Nothing is sent to the device.</summary>
@@ -233,6 +300,7 @@ namespace M10Modbus
 
         private void ShowMessage(string weight, Tone tone, string state)
         {
+            _instrument = null;
             _weightText = weight; _weightIsMessage = true; _weightTone = tone;
             _stateText = state; _stateTone = tone;
         }
@@ -251,19 +319,20 @@ namespace M10Modbus
                 case CardPhase.Off:
                     string stopped = $"Опрос остановлен{lastData} · ответов {_ok} · сбоев {_errors}";
                     return new CardView(stopped, Tone.Stale, _deviceInfo, snapshotWeight, snapshotIsMessage, Tone.Stale,
-                        _snapshot!.StateText, Tone.Stale, false);
+                        _snapshot!.StateText, Tone.Stale, false) { Instrument = _snapshot.Instrument };
                 case CardPhase.Connecting:
                     return new CardView($"Подключение к {Endpoint} · Id {_settings.UnitId} · инициализация…", Tone.Info, "",
                         snapshotWeight, snapshotIsMessage, Tone.Stale,
-                        _snapshot?.StateText ?? "Ожидание первого ответа", _snapshot != null ? Tone.Stale : Tone.Neutral, showReset);
+                        _snapshot?.StateText ?? "Ожидание первого ответа", _snapshot != null ? Tone.Stale : Tone.Neutral, showReset)
+                        { Instrument = _snapshot?.Instrument };
                 case CardPhase.CommError:
-                    return new CardView($"Нет связи · переподключение{lastData} · сбоев {_errors}", Tone.Bad, _connectionError,
+                    return new CardView($"{(_requiresOperatorAction ? "Опрос приостановлен · требуется проверка настроек" : "Нет связи · переподключение")}{lastData} · сбоев {_errors}", Tone.Bad, _connectionError,
                         snapshotWeight, snapshotIsMessage, Tone.Stale,
-                        "Ошибка обмена: " + _connectionError, Tone.Bad, showReset);
+                        (_requiresOperatorAction ? "Настройки: " : "Ошибка обмена: ") + _connectionError, Tone.Bad, showReset) { Instrument = _snapshot?.Instrument };
                 default:
                     string ms = _responseMs.ToString("F0", CultureInfo.InvariantCulture);
                     return new CardView($"Подключено · ответ {Time(_responseTime)} за {ms} мс · ответов {_ok} · сбоев {_errors}", Tone.Good, _deviceInfo,
-                        _weightText, _weightIsMessage, _weightTone, _stateText, _stateTone, showReset);
+                        _weightText, _weightIsMessage, _weightTone, _stateText, _stateTone, showReset) { Instrument = _instrument };
             }
         }
 

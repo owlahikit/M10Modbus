@@ -185,13 +185,42 @@ public class TraceFormatterTests
             Brutto = 1234.5f, Netto = 1234.5f, Tare = 0, Unit = "кг", Division = 0.5f, Range = 1, MeasurementUnixTime = 1730228779
         };
         var (text, isError) = TraceFormatter.FormatData(r, 1);
-        Assert.Equal("21:47:35.703 [Прибор 1] Данные №21 · Весы 1 | Errors=0x0000: Ошибок нет | Status=0x0002 | Stable=1 Zero=0 BelowMin=0 | Брутто=1234.5 Нетто=1234.5 Тара=0 кг | d=0.5 | Диапазон=1 DT_LastWeight=1730228779", text);
+        Assert.Equal("21: 21:47:35.703 [Прибор 1] Весы 1: Брутто=1234.5 Нетто=1234.5 Тара=0 кг d=0.5 | Диапазон=1 | Stable=1 Zero=0 BelowMin=0 | Ошибок нет", text);
         Assert.False(isError);
 
         var failed = new M10PollResult { Timestamp = T("21:47:44.700"), ConnectionError = "Нет полного ответа за 1500 мс (адрес 2000, слов 13, получено 0 байт)." };
         var (errorText, err) = TraceFormatter.FormatData(failed, 1);
         Assert.Equal("21:47:44.700 [Прибор 1] Ошибка обмена: Нет полного ответа за 1500 мс (адрес 2000, слов 13, получено 0 байт).", errorText);
         Assert.True(err);
+    }
+
+    [Fact]
+    public void Data_MatchesRequestedLayoutAndUsesCardNumber()
+    {
+        var r = new M10PollResult
+        {
+            Timestamp = T("18:36:07.701"), IsConnected = true, TransactionId = 1474, ScaleNumber = 1, StatusMask = 2,
+            Brutto = 75.6f, Netto = 75.6f, Tare = 0, Unit = "т", Division = 0.05f,
+            Range = 2, MeasurementUnixTime = 1793643944
+        };
+        var (text, isError) = TraceFormatter.FormatData(r, 2);
+        Assert.Equal("1474: 18:36:07.701 [Прибор 2] Весы 1: Брутто=75.5999985 Нетто=75.5999985 Тара=0 т d=0.0500000007 | Диапазон=2 | Stable=1 Zero=0 BelowMin=0 | Ошибок нет", text);
+        Assert.False(isError);
+    }
+
+    [Fact]
+    public void Data_ErrorKeepsCodeAndDescription()
+    {
+        var r = new M10PollResult
+        {
+            Timestamp = T("18:36:07.701"), IsConnected = true, TransactionId = 1475, ScaleNumber = 1,
+            ErrorCode = 2, StatusMask = 4, Division = 0.05f, Unit = "т"
+        };
+        var (text, isError) = TraceFormatter.FormatData(r, 2);
+        Assert.StartsWith("1475: 18:36:07.701 [Прибор 2] Весы 1: Брутто=", text);
+        Assert.EndsWith("0x0002: нагрузка ниже заданного порога", text);
+        Assert.Contains("Stable=0 Zero=0 BelowMin=1", text);
+        Assert.True(isError);
     }
 
     [Fact]
@@ -203,5 +232,110 @@ public class TraceFormatterTests
             TraceFormatter.FormatEvent(T("21:50:02.410"), 1, "10.0.1.18:502", "Опрос выключен оператором. Ответов 601, сбоев 0."));
         Assert.Equal("21:47:31.102 [Система] Обозначения: № — номер транзакции Modbus TCP (одинаков в запросе и ответе); Id — адрес устройства (Unit Identifier, 7-й байт, как адрес в RTU); FC — код функции (hex); адрес и регистров — dec (hex), адреса как в документе, без смещения −1; HEX: 6 байт TCP-префикса (№, протокол 0, длина) → Id + PDU (= кадр RTU без CRC); «период» — от предыдущего TX показаний этого прибора; «ответ через» — от отправки TX до последнего байта ответа; инициализация (1000, 1100…) идёт подряд без периода.",
             TraceFormatter.LegendLine(T("21:47:31.102")));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Identification_DecodesRealSample_InBothWordOrders(bool lowWordFirst)
+    {
+        ushort[] words = { 100, 53596, 1, 85, 0x6AE7, 0x94C2, 0x6AE4, 0xC1A0, lowWordFirst ? (ushort)1 : (ushort)0 };
+        if (lowWordFirst)
+            for (int i = 2; i < 8; i += 2) (words[i], words[i + 1]) = (words[i + 1], words[i]);
+        var result = TraceFormatter.FormatInitializationData(Initialization(TracePhase.Identification, words, lowWordFirst), 1)!.Value;
+        Assert.Equal("21:47:31.152 [Прибор 1] Идентификация №1 | Тип=100 (M10) | SN=53596 | FW=1.085 | DT_Current=1793561794 | DT_Boot=1793376672" +
+            $" | Endians={(lowWordFirst ? 1 : 0)} ({(lowWordFirst ? "младшее" : "старшее")} слово первым)", result.Text);
+        Assert.False(result.IsError);
+    }
+
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(true, 2)]
+    [InlineData(true, 3)]
+    public void Configuration_DecodesUsedRangesOnly(bool lowWordFirst, int scale)
+    {
+        var result = TraceFormatter.FormatInitializationData(
+            Initialization(TracePhase.ScaleConfig, ConfigWords(lowWordFirst), lowWordFirst, scale), 2)!.Value;
+        Assert.Equal($"21:47:31.152 [Прибор 2] Конфигурация №2 · Весы {scale} | SN весов=45000 | Единица=1 (т)" +
+            " | Тип диапазонов=2 (многодиапазонные) | Диапазонов=2" +
+            " | Диапазон 1: Min=0.399999976 Max=60 d=0.0199999996" +
+            " | Диапазон 2: Min=1 Max=80 d=0.0500000007", result.Text);
+        Assert.DoesNotContain("Диапазон 3:", result.Text);
+        Assert.False(result.IsError);
+    }
+
+    [Fact]
+    public void Initialization_InvalidSemanticValues_AreExplicitErrors()
+    {
+        ushort[] info = { 100, 1, 1, 85, 0, 0, 0, 0, 2 };
+        var badEndian = TraceFormatter.FormatInitializationData(Initialization(TracePhase.Identification, info), 1)!.Value;
+        Assert.True(badEndian.IsError);
+        Assert.Contains("FW и DT не расшифрованы", badEndian.Text);
+        var missing = TraceFormatter.FormatInitializationData(
+            Initialization(TracePhase.ScaleConfig, new ushort[22], scale: 2), 2)!.Value;
+        Assert.True(missing.IsError);
+        Assert.Contains("Весы 2", missing.Text);
+        Assert.Contains("Диапазонов=0", missing.Text);
+        Assert.Contains("НЕКОРРЕКТНО", missing.Text);
+        var words = ConfigWords(false);
+        words[3] = ushort.MaxValue;
+        var count = TraceFormatter.FormatInitializationData(Initialization(TracePhase.ScaleConfig, words), 1)!.Value;
+        Assert.True(count.IsError);
+        Assert.DoesNotContain("Диапазон 1:", count.Text);
+    }
+
+    [Fact]
+    public void Initialization_DoesNotDecodeRejectedOrIncompleteFrames()
+    {
+        var words = ConfigWords(false);
+        foreach (var trace in new[]
+        {
+            Initialization(TracePhase.ScaleConfig, words, complete: false),
+            Initialization(TracePhase.ScaleConfig, words, note: "№ ответа не совпадает"),
+            Initialization(TracePhase.ScaleConfig, words, direction: "TX"),
+            Initialization(TracePhase.Poll, new ushort[13])
+        })
+            Assert.Null(TraceFormatter.FormatInitializationData(trace, 1));
+        foreach (int byteIndex in new[] { 0, 2, 5, 6, 7, 8 })
+        {
+            var trace = Initialization(TracePhase.ScaleConfig, words);
+            trace.Bytes[byteIndex] ^= 1;
+            Assert.Null(TraceFormatter.FormatInitializationData(trace, 1));
+        }
+    }
+
+    private static ushort[] ConfigWords(bool lowWordFirst)
+    {
+        var words = new ushort[22];
+        words[0] = 45000; words[1] = 1; words[2] = 2; words[3] = 2;
+        float[] values = { BitConverter.Int32BitsToSingle(0x3ECCCCCC), 60, 0.02f, 1, 80, 0.05f, 999, 999, 999 };
+        for (int i = 0; i < values.Length; i++)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(values[i]);
+            words[4 + 2 * i] = lowWordFirst ? (ushort)bits : (ushort)(bits >> 16);
+            words[5 + 2 * i] = lowWordFirst ? (ushort)(bits >> 16) : (ushort)bits;
+        }
+        return words;
+    }
+
+    private static ModbusTrace Initialization(TracePhase phase, ushort[] words, bool lowWordFirst = false, int scale = 1,
+        bool complete = true, string note = "", string direction = "RX")
+    {
+        ushort tid = phase == TracePhase.Identification ? (ushort)1 : (ushort)2;
+        var bytes = new byte[9 + 2 * words.Length];
+        bytes[1] = (byte)tid; bytes[5] = (byte)(3 + 2 * words.Length);
+        bytes[6] = 1; bytes[7] = 3; bytes[8] = (byte)(2 * words.Length);
+        for (int i = 0; i < words.Length; i++)
+        {
+            bytes[9 + 2 * i] = (byte)(words[i] >> 8);
+            bytes[10 + 2 * i] = (byte)words[i];
+        }
+        return new ModbusTrace
+        {
+            Timestamp = T("21:47:31.152"), TransactionId = tid, UnitId = 1, Direction = direction,
+            Phase = phase, RegisterCount = (ushort)words.Length, ScaleNumber = scale, LowWordFirst = lowWordFirst,
+            StartAddress = phase == TracePhase.Identification ? (ushort)1000 : (ushort)(1100 + 33 * (scale - 1)),
+            Bytes = bytes, IsComplete = complete, Note = note
+        };
     }
 }

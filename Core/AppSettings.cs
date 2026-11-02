@@ -61,9 +61,7 @@ namespace M10Modbus
         public int Port { get; set; } = 502;
         public int UnitId { get; set; } = 1;
         public int Scale { get; set; } = 1;
-        public bool ReadUnrounded { get; set; }
         public int? Digits { get; set; }
-        public string UnroundedAddress { get; set; } = "";
     }
 
     public sealed class WindowSettings
