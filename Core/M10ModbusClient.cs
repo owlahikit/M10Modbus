@@ -9,21 +9,28 @@ using System.Threading.Tasks;
 
 namespace M10Modbus
 {
+    public sealed record ScaleRange(int Number, float Minimum, float Maximum, float Division);
+
+    public enum PollFailure { None, Transport, Protocol, Configuration, ModbusException }
+
     public sealed class M10PollResult
     {
         public DateTime Timestamp { get; set; } = DateTime.Now;
         // True only after a complete, validated Modbus exchange and device identification.
         public bool IsConnected { get; set; }
         public string ConnectionError { get; set; } = "";
+        public PollFailure Failure { get; set; }
+        public bool RequiresOperatorAction { get; set; }
+        public string ConfigurationWarning { get; set; } = "";
         public ushort ErrorCode { get; set; }
         public ushort StatusMask { get; set; }
         public bool HasScaleError => ErrorCode != 0;
+        public bool IsBelowThreshold => (ErrorCode & 0x0002) != 0;
+        public bool IsAboveThreshold => (ErrorCode & 0x0004) != 0;
         public bool IsStable => (StatusMask & 2) != 0;
         public bool IsZero => (StatusMask & 1) != 0;
         public bool IsBelowMinimum => (StatusMask & 4) != 0;
         public float Brutto { get; set; }
-        public float? BruttoUnrounded { get; set; }
-        public string UnroundedError { get; set; } = "";
         public float Netto { get; set; }
         public float Tare { get; set; }
         public float Division { get; set; }
@@ -32,6 +39,8 @@ namespace M10Modbus
         public string Unit { get; set; } = "";
         public string DeviceInfo { get; set; } = "";
         public int ScaleNumber { get; set; } = 1;
+        public ushort ScaleSerialNumber { get; set; }
+        public IReadOnlyList<ScaleRange> Ranges { get; set; } = Array.Empty<ScaleRange>();
         /// <summary>Whole PollAsync call, including (re)connection and initialization. Not shown in the UI.</summary>
         public double ElapsedMs { get; set; }
         /// <summary>Transaction number of the current-weight read (0 if it was not sent).</summary>
@@ -51,13 +60,14 @@ namespace M10Modbus
         public string FormatWeight(float value, IFormatProvider? provider = null)
         {
             if (!float.IsFinite(value) || !float.IsFinite(Division) || Division <= 0) return "—";
-            // G7 removes binary float noise; unlike -log10(d), this also handles d = 0.25 or 0.125.
-            string[] parts = Division.ToString("G7", CultureInfo.InvariantCulture).Split('E', 'e');
-            int dot = parts[0].IndexOf('.');
-            int fraction = dot < 0 ? 0 : parts[0].Length - dot - 1;
-            int exponent = parts.Length == 2 ? int.Parse(parts[1], CultureInfo.InvariantCulture) : 0;
-            int decimals = Math.Max(0, fraction - exponent);
-            return value.ToString(decimals <= 9 ? "F" + decimals : "G9", provider ?? CultureInfo.CurrentCulture);
+            // Match the M10 screen: three decimal places.
+            string roundTrip = value.ToString("R", CultureInfo.InvariantCulture);
+            if (decimal.TryParse(roundTrip, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal exact))
+            {
+                decimal rounded = decimal.Round(exact, 3, MidpointRounding.AwayFromZero);
+                return (rounded == 0 ? 0m : rounded).ToString("F3", provider ?? CultureInfo.CurrentCulture);
+            }
+            return value.ToString("F3", provider ?? CultureInfo.CurrentCulture);
         }
 
         public string GetMetrologicalErrorDescription()
@@ -65,8 +75,8 @@ namespace M10Modbus
             if (ErrorCode == 0) return "Ошибок нет";
             var parts = new List<string>();
             if ((ErrorCode & 1) != 0) parts.Add("клеймо нарушено");
-            if ((ErrorCode & 2) != 0) parts.Add("нагрузка выше заданного порога");
-            if ((ErrorCode & 4) != 0) parts.Add("нагрузка ниже заданного порога");
+            if (IsBelowThreshold) parts.Add("нагрузка ниже заданного порога");
+            if (IsAboveThreshold) parts.Add("нагрузка выше заданного порога");
             if ((ErrorCode & 8) != 0) parts.Add("авария платформы");
             if ((ErrorCode & 0xFFF0) != 0) parts.Add($"неописанные биты 0x{ErrorCode & 0xFFF0:X4}");
             return $"0x{ErrorCode:X4}: {string.Join("; ", parts)}";
@@ -97,6 +107,7 @@ namespace M10Modbus
         public bool IsComplete { get; init; } = true;
         public TracePhase Phase { get; init; } = TracePhase.Poll;
         public int ScaleNumber { get; init; } = 1;
+        public bool LowWordFirst { get; init; }
         /// <summary>RX: from TX (right before WriteAsync) to the last byte, or to the failure.</summary>
         public double? ResponseMs { get; init; }
         /// <summary>Current-weight TX: from the previous current-weight TX of this client; null for the first one after (re)initialization.</summary>
@@ -121,6 +132,10 @@ namespace M10Modbus
         private bool _lowWordFirst;
         private string _unit = "";
         private string _deviceInfo = "";
+        private ushort _scaleSerialNumber;
+        private IReadOnlyList<ScaleRange> _ranges = Array.Empty<ScaleRange>();
+        private string _configurationWarning = "";
+        private M10PollResult? _permanentFailure;
         private bool _disposed;
         private int _timeoutMs = 1500;
         private long _lastPollTxTicks;
@@ -128,7 +143,6 @@ namespace M10Modbus
         public int Port { get; }
         public byte UnitId { get; }
         public int ScaleNumber { get; }
-        public bool ReadUnrounded { get; }
         public string Endpoint => FormatEndpoint(IpAddress, Port);
         public static string FormatEndpoint(string ip, int port) => ip.Contains(':') ? $"[{ip}]:{port}" : $"{ip}:{port}";
         public ushort CurrentAddress => (ushort)(2000 + 33 * (ScaleNumber - 1));
@@ -141,18 +155,18 @@ namespace M10Modbus
         public bool IsConnected => _stream != null && _tcpClient?.Connected == true;
         public event Action<ModbusTrace>? Trace;
 
-        public M10ModbusClient(string ipAddress, int port = 502, byte unitId = 1, int scaleNumber = 1, bool readUnrounded = false)
+        public M10ModbusClient(string ipAddress, int port = 502, byte unitId = 1, int scaleNumber = 1)
         {
             if (string.IsNullOrWhiteSpace(ipAddress)) throw new ArgumentException("Не задан адрес прибора.", nameof(ipAddress));
             if (port < 1 || port > 65535) throw new ArgumentOutOfRangeException(nameof(port));
             if (scaleNumber < 1 || scaleNumber > 3) throw new ArgumentOutOfRangeException(nameof(scaleNumber));
-            IpAddress = ipAddress.Trim(); Port = port; UnitId = unitId; ScaleNumber = scaleNumber; ReadUnrounded = readUnrounded;
+            IpAddress = ipAddress.Trim(); Port = port; UnitId = unitId; ScaleNumber = scaleNumber;
         }
 
         public async Task ConnectAsync(CancellationToken ct = default)
         {
             await _gate.WaitAsync(ct).ConfigureAwait(false);
-            try { ThrowIfDisposed(); await ConnectCoreAsync(ct).ConfigureAwait(false); }
+            try { ThrowIfDisposed(); _permanentFailure = null; await ConnectCoreAsync(ct).ConfigureAwait(false); }
             finally { _gate.Release(); }
         }
 
@@ -177,10 +191,7 @@ namespace M10Modbus
 
         public Task<M10PollResult> PollAsync(CancellationToken ct = default) => PollAsync(PollSlot.Immediate, ct);
 
-        public Task<M10PollResult> PollAsync(PollSlot slot, CancellationToken ct = default) =>
-            PollAsync(slot, ReadUnrounded, ct);
-
-        public async Task<M10PollResult> PollAsync(PollSlot slot, bool readUnrounded, CancellationToken ct = default)
+        public async Task<M10PollResult> PollAsync(PollSlot slot, CancellationToken ct = default)
         {
             await _gate.WaitAsync(ct).ConfigureAwait(false);
             var timer = Stopwatch.StartNew();
@@ -190,30 +201,52 @@ namespace M10Modbus
             {
                 ThrowIfDisposed();
                 ct.ThrowIfCancellationRequested();
+                if (_permanentFailure != null)
+                {
+                    result.Failure = _permanentFailure.Failure;
+                    result.RequiresOperatorAction = true;
+                    result.ConnectionError = _permanentFailure.ConnectionError;
+                    return result;
+                }
                 if (!IsConnected) { result.Reinitialized = true; await ConnectCoreAsync(ct).ConfigureAwait(false); }
                 if (!_initialized) { result.Reinitialized = true; await InitializeAsync(ct).ConfigureAwait(false); }
-                ushort[] words = await ReadHoldingRegistersAsync(CurrentAddress, readUnrounded ? (ushort)15 : CurrentRegisterCount,
+                ushort[] words = await ReadHoldingRegistersAsync(CurrentAddress, CurrentRegisterCount,
                     TracePhase.Poll, slot, exchange, ct).ConfigureAwait(false);
                 result.Timestamp = exchange.RxTime;
                 result.MeasurementUnixTime = ReadUInt32(words, 0);
                 result.ErrorCode = words[2]; result.StatusMask = words[3]; result.Range = words[4];
                 result.Division = ReadFloat(words, 5); result.Brutto = ReadFloat(words, 7);
                 result.Netto = ReadFloat(words, 9); result.Tare = ReadFloat(words, 11);
-                if (readUnrounded)
-                {
-                    float unrounded = ReadFloat(words, 13);
-                    if (float.IsFinite(unrounded)) result.BruttoUnrounded = unrounded;
-                    else result.UnroundedError = "Брутто без округления: NaN/Infinity";
-                }
-                result.Unit = _unit; result.DeviceInfo = _deviceInfo; result.IsConnected = true;
+                result.Unit = _unit; result.DeviceInfo = _deviceInfo;
+                result.ScaleSerialNumber = _scaleSerialNumber; result.Ranges = _ranges;
+                result.ConfigurationWarning = _configurationWarning;
+                result.IsConnected = true;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 Disconnect(); throw;
             }
+            catch (ConfigurationException ex)
+            {
+                Disconnect();
+                result.Failure = PollFailure.Configuration;
+                result.RequiresOperatorAction = true;
+                result.ConnectionError = ex.Message;
+                _permanentFailure = result;
+            }
+            catch (ModbusException ex)
+            {
+                Disconnect();
+                result.Failure = PollFailure.ModbusException;
+                result.RequiresOperatorAction = ex.Code is 1 or 2 or 3;
+                result.ConnectionError = $"{Endpoint}, весы {ScaleNumber}: {ex.Message}" +
+                    (result.RequiresOperatorAction ? " Проверьте номер весов и настройки прибора; выключите и снова включите опрос после исправления." : "");
+                if (result.RequiresOperatorAction) _permanentFailure = result;
+            }
             catch (Exception ex) when (ex is IOException || ex is SocketException || ex is TimeoutException || ex is InvalidDataException)
             {
                 Disconnect(); result.Timestamp = DateTime.Now; result.ConnectionError = ex.Message;
+                result.Failure = ex is InvalidDataException ? PollFailure.Protocol : PollFailure.Transport;
             }
             finally
             {
@@ -228,19 +261,56 @@ namespace M10Modbus
         private async Task InitializeAsync(CancellationToken ct)
         {
             ushort[] info = await ReadHoldingRegistersAsync(1000, 9, TracePhase.Identification, PollSlot.Immediate, null, ct).ConfigureAwait(false);
-            if (info[0] != 100) throw new InvalidDataException($"Регистр 1000: тип {info[0]}, ожидался M10 (100).");
-            if (info[8] > 1) throw new InvalidDataException($"Регистр Endians (1008): неизвестное значение {info[8]}.");
+            if (info[0] != 100) throw ConfigError($"Регистр 1000: тип {info[0]}, ожидался M10 (100).");
+            if (info[8] > 1) throw ConfigError($"Регистр Endians (1008): неизвестное значение {info[8]}.");
             _lowWordFirst = info[8] == 1;
             uint firmware = ReadUInt32(info, 2);
             if ((firmware >> 16) != 1)
-                throw new InvalidDataException($"Firmware {firmware >> 16}.{firmware & 0xFFFF:D3}: протокол рассчитан на 001.XXX.");
+                throw ConfigError($"Firmware {firmware >> 16}.{firmware & 0xFFFF:D3}: протокол рассчитан на 001.XXX.");
             ushort configAddress = (ushort)(1100 + 33 * (ScaleNumber - 1));
-            ushort[] config = await ReadHoldingRegistersAsync(configAddress, 4, TracePhase.ScaleConfig, PollSlot.Immediate, null, ct).ConfigureAwait(false);
-            if (config[1] > 1) throw new InvalidDataException($"Регистр {configAddress + 1}: неизвестная единица веса {config[1]}.");
+            ushort[] config = await ReadHoldingRegistersAsync(configAddress, 22, TracePhase.ScaleConfig, PollSlot.Immediate, null, ct).ConfigureAwait(false);
+            if (Array.TrueForAll(config, word => word == 0))
+                throw ConfigError($"Регистры {configAddress}–{configAddress + 21} содержат только нули: выбранные весы могут отсутствовать.");
+            if (config[1] > 1) throw ConfigError($"Регистр {configAddress + 1}: неизвестная единица веса {config[1]}.");
+            var ranges = new List<ScaleRange>();
+            _configurationWarning = config[2] > 2 ? $"Регистр {configAddress + 2}: неизвестный тип диапазонов {config[2]}."
+                : config[3] < 1 || config[3] > 3 ? $"Регистр {configAddress + 3}: недопустимое число диапазонов {config[3]} (ожидалось 1..3)."
+                : "";
+            for (int i = 0; _configurationWarning.Length == 0 && i < config[3]; i++)
+            {
+                int offset = 4 + i * 6;
+                float minimum = ReadFloat(config, offset);
+                float maximum = ReadFloat(config, offset + 2);
+                float division = ReadFloat(config, offset + 4);
+                if (!float.IsFinite(minimum) || !float.IsFinite(maximum) || !float.IsFinite(division) ||
+                    minimum < 0 || maximum < minimum || division <= 0)
+                {
+                    _configurationWarning = $"Конфигурация весов {ScaleNumber}, диапазон {i + 1}: недопустимые Min, Max или d.";
+                    ranges.Clear();
+                    break;
+                }
+                ranges.Add(new ScaleRange(i + 1, minimum, maximum, division));
+            }
+            _scaleSerialNumber = config[0];
+            _ranges = ranges.AsReadOnly();
             _unit = config[1] == 0 ? "кг" : "т";
             _deviceInfo = $"M10 SN {info[1]} · FW {firmware >> 16}.{firmware & 0xFFFF:D3} · " +
                 $"весы {ScaleNumber} SN {config[0]} · {(_lowWordFirst ? "младшее слово первым" : "старшее слово первым")}";
             _initialized = true;
+        }
+
+        private ConfigurationException ConfigError(string detail) => new ConfigurationException(
+            $"{Endpoint}, весы {ScaleNumber}: {detail} Проверьте номер весов и настройки прибора; выключите и снова включите опрос после исправления.");
+
+        private sealed class ConfigurationException : Exception
+        {
+            public ConfigurationException(string message) : base(message) { }
+        }
+
+        private sealed class ModbusException : Exception
+        {
+            public byte Code { get; }
+            public ModbusException(byte code) : base($"Modbus 0x{code:X2}: {ExceptionDescription(code)}.") => Code = code;
         }
 
         private sealed class Exchange
@@ -303,7 +373,7 @@ namespace M10Modbus
                 responseLogged = true;
                 if (invalid != null) throw new InvalidDataException(invalid);
                 if (received[7] == 0x83)
-                    throw new InvalidDataException($"Modbus 0x{received[8]:X2}: {ExceptionDescription(received[8])}.");
+                    throw new ModbusException(received[8]);
                 var words = new ushort[count];
                 for (int i = 0; i < count; i++) words[i] = (ushort)((received[9 + i * 2] << 8) | received[10 + i * 2]);
                 return words;
@@ -346,7 +416,7 @@ namespace M10Modbus
             {
                 Trace?.Invoke(new ModbusTrace { Timestamp = time, Direction = direction, Endpoint = Endpoint,
                     TransactionId = tid, UnitId = UnitId, StartAddress = start, RegisterCount = count,
-                    Bytes = bytes, IsComplete = complete, Phase = phase, ScaleNumber = ScaleNumber,
+                    Bytes = bytes, IsComplete = complete, Phase = phase, ScaleNumber = ScaleNumber, LowWordFirst = _lowWordFirst,
                     ResponseMs = responseMs, PeriodMs = periodMs, PlannedPeriodMs = plannedPeriodMs,
                     Overrun = overrun, ExpectedLength = expectedLength, Note = note });
             }
@@ -359,10 +429,13 @@ namespace M10Modbus
             3 => "недопустимое значение данных", 4 => "внутренняя ошибка устройства",
             6 => "устройство занято", _ => "неизвестное исключение"
         };
-        private uint ReadUInt32(ushort[] words, int offset) => _lowWordFirst
+        internal static uint DecodeUInt32(ushort[] words, int offset, bool lowWordFirst) => lowWordFirst
             ? ((uint)words[offset + 1] << 16) | words[offset]
             : ((uint)words[offset] << 16) | words[offset + 1];
-        private float ReadFloat(ushort[] words, int offset) => BitConverter.Int32BitsToSingle(unchecked((int)ReadUInt32(words, offset)));
+        internal static float DecodeFloat(ushort[] words, int offset, bool lowWordFirst) =>
+            BitConverter.Int32BitsToSingle(unchecked((int)DecodeUInt32(words, offset, lowWordFirst)));
+        private uint ReadUInt32(ushort[] words, int offset) => DecodeUInt32(words, offset, _lowWordFirst);
+        private float ReadFloat(ushort[] words, int offset) => DecodeFloat(words, offset, _lowWordFirst);
         private void ThrowIfDisposed() { if (_disposed) throw new ObjectDisposedException(nameof(M10ModbusClient)); }
         public void Disconnect()
         {

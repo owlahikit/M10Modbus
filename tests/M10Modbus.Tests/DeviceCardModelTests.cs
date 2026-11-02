@@ -7,8 +7,8 @@ public class DeviceCardModelTests
 {
     private static readonly DateTime T0 = new(2026, 10, 29, 21, 47, 35, 703);
 
-    private static DeviceSettings Settings(bool unrounded = false) =>
-        new() { Ip = "10.0.1.18", Port = 502, UnitId = 1, Scale = 1, ReadUnrounded = unrounded };
+    private static DeviceSettings Settings() =>
+        new() { Ip = "10.0.1.18", Port = 502, UnitId = 1, Scale = 1 };
 
     private static M10PollResult Ok(DateTime t, ushort error = 0, ushort status = 2) => new()
     {
@@ -45,7 +45,7 @@ public class DeviceCardModelTests
     {
         var m = new DeviceCardModel(1);
         var ev = m.Start(Settings(), true, T0, 250, 1500);
-        Assert.Equal("Опрос включён: 10.0.1.18:502, Id 1, весы 1, без округления: нет; период 250 мс, таймаут 1500 мс, фиксация ошибок: да.", ev.Single().Text);
+        Assert.Equal("Опрос включён: 10.0.1.18:502, Id 1, весы 1; период 250 мс, таймаут 1500 мс, фиксация ошибок: да.", ev.Single().Text);
         Assert.Equal(CardPhase.Connecting, m.Phase);
         Assert.Equal("Подключение к 10.0.1.18:502 · Id 1 · инициализация…", m.View.StatusText);
         Assert.Equal(Tone.Info, m.View.StatusTone);
@@ -133,15 +133,15 @@ public class DeviceCardModelTests
         Assert.False(m.View.ShowLatchReset);
 
         m.Apply(Ok(T0.AddSeconds(1), error: 2));
-        Assert.Equal(("Ошибка 0x0002", true, Tone.Bad), (m.View.WeightText, m.View.WeightIsMessage, m.View.WeightTone));
-        Assert.Equal("0x0002: нагрузка выше заданного порога · вес недействителен по флагу Errors", m.View.StateText);
+        Assert.Equal(("Авария", true, Tone.Bad), (m.View.WeightText, m.View.WeightIsMessage, m.View.WeightTone));
+        Assert.Equal("0x0002: нагрузка ниже заданного порога · вес недействителен по флагу Errors", m.View.StateText);
         Assert.True(m.View.ShowLatchReset);
         m.Apply(Ok(T0.AddSeconds(2), error: 4));
         m.Apply(Ok(T0.AddSeconds(3), error: 4));
-        Assert.Equal("0x0004: нагрузка ниже заданного порога · ошибка зафиксирована — снимите фиксацию после проверки", m.View.StateText);
+        Assert.Equal("0x0004: нагрузка выше заданного порога · ошибка зафиксирована — снимите фиксацию после проверки", m.View.StateText);
 
         for (int i = 0; i < 20; i++) m.Apply(Ok(T0.AddSeconds(4 + i)));
-        Assert.Equal(("Фиксация 0x0006", Tone.Warn), (m.View.WeightText, m.View.WeightTone));
+        Assert.Equal(("Фиксация Аварии 0x0006", Tone.Warn), (m.View.WeightText, m.View.WeightTone));
         Assert.Equal(("Сейчас ошибок нет · предыдущая ошибка зафиксирована", Tone.Warn), (m.View.StateText, m.View.StateTone));
         Assert.True(m.View.ShowLatchReset);
 
@@ -193,6 +193,82 @@ public class DeviceCardModelTests
     }
 
     [Fact]
+    public void DisableLatchDuringLiveHeldAlarm_ReleasesImmediatelyUsingLastValidReading()
+    {
+        var m = Started();
+        for (int i = 0; i < 3; i++) m.Apply(Ok(T0.AddSeconds(i), error: 2));
+        var last = Ok(T0.AddSeconds(3));
+        m.Apply(last);
+        Assert.StartsWith("Фиксация Аварии", m.View.WeightText);
+        long count = m.Ok;
+
+        var events = m.SetLatchEnabled(false, T0.AddSeconds(4));
+        Assert.Contains(events, e => e.Text == "Фиксация ошибок выключена.");
+        Assert.Equal(Weight(last), m.View.WeightText);
+        Assert.False(m.View.ShowLatchReset);
+        Assert.Equal(count, m.Ok);
+    }
+
+    [Fact]
+    public void DisableLatchDuringCurrentAlarm_DoesNotHideAlarmOrUseInvalidWeight()
+    {
+        var m = Started();
+        for (int i = 0; i < 3; i++) m.Apply(Ok(T0.AddSeconds(i), error: 2));
+        m.SetLatchEnabled(false, T0.AddSeconds(3));
+        Assert.Equal("Авария", m.View.WeightText);
+        Assert.Contains("вес недействителен по флагу Errors", m.View.StateText);
+        Assert.False(m.View.ShowLatchReset);
+        var recovered = Ok(T0.AddSeconds(4));
+        m.Apply(recovered);
+        Assert.Equal(Weight(recovered), m.View.WeightText);
+    }
+
+    [Fact]
+    public void EnableLatchWhilePolling_TracksSubsequentErrors()
+    {
+        var m = Started(latch: false);
+        m.Apply(Ok(T0, error: 2));
+        m.SetLatchEnabled(true, T0.AddSeconds(1));
+        Assert.Equal("Авария", m.View.WeightText);
+        Assert.False(m.View.ShowLatchReset);
+        for (int i = 0; i < 3; i++) m.Apply(Ok(T0.AddSeconds(2 + i), error: 4));
+        m.Apply(Ok(T0.AddSeconds(5)));
+        Assert.Equal("Фиксация Аварии 0x0004", m.View.WeightText);
+        Assert.True(m.View.ShowLatchReset);
+    }
+
+    [Fact]
+    public void DisableLatchDuringDisconnect_DoesNotShowStaleReadingAsLive()
+    {
+        var m = Started();
+        for (int i = 0; i < 3; i++) m.Apply(Ok(T0.AddSeconds(i), error: 2));
+        m.Apply(Ok(T0.AddSeconds(3)));
+        m.Apply(Fail(T0.AddSeconds(4)));
+        m.SetLatchEnabled(false, T0.AddSeconds(5));
+        Assert.Equal(CardPhase.CommError, m.Phase);
+        Assert.Equal(Tone.Stale, m.View.WeightTone);
+        Assert.False(m.View.ShowLatchReset);
+        var recovered = Ok(T0.AddSeconds(6));
+        m.Apply(recovered);
+        Assert.Equal(Weight(recovered), m.View.WeightText);
+    }
+
+    [Fact]
+    public void DisableLatchDuringRecheck_ImmediatelyShowsLastValidReading()
+    {
+        var m = Started();
+        m.Apply(Ok(T0, error: 2));
+        var last = Ok(T0.AddSeconds(1));
+        m.Apply(last);
+        Assert.Equal("Проверка 1/12", m.View.WeightText);
+        m.SetLatchEnabled(false, T0.AddSeconds(2));
+        Assert.Equal(Weight(last), m.View.WeightText);
+        m.SetLatchEnabled(true, T0.AddSeconds(3));
+        m.Apply(Ok(T0.AddSeconds(4)));
+        Assert.False(m.View.WeightIsMessage);
+    }
+
+    [Fact]
     public void Off_HidesLatchButton_SnapshotKeepsMessage()
     {
         var m = Started();
@@ -200,13 +276,13 @@ public class DeviceCardModelTests
         Assert.True(m.View.ShowLatchReset);
         m.Stop(T0.AddSeconds(1), "оператором");
         Assert.False(m.View.ShowLatchReset);
-        Assert.Equal(("Ошибка 0x0002", true, Tone.Stale), (m.View.WeightText, m.View.WeightIsMessage, m.View.WeightTone));
+        Assert.Equal(("Авария", true, Tone.Stale), (m.View.WeightText, m.View.WeightIsMessage, m.View.WeightTone));
         Assert.Equal(Tone.Stale, m.View.StateTone);
         Assert.Contains("последние данные на 21:47:35.703", m.View.StatusText);
     }
 
     [Fact]
-    public void InvalidData_And_Unrounded_And_Digits()
+    public void InvalidData_HidesWeightAndIndicators()
     {
         var m = Started();
         var bad = Ok(T0); bad.Division = 0;
@@ -214,146 +290,178 @@ public class DeviceCardModelTests
         Assert.Equal(("Некорректные данные", Tone.Bad), (m.View.WeightText, m.View.WeightTone));
         Assert.Equal("Числовые значения или дискретность d недопустимы — см. HEX/расшифровку", m.View.StateText);
 
-        m.Digits = 2;
-        var r = Ok(T0.AddSeconds(1));
-        r.BruttoUnrounded = 1234.5f;
-        m.Apply(r);
-        Assert.Equal(1234.5f.ToString("F2", CultureInfo.CurrentCulture) + " кг", m.View.WeightText);
-
-        var u = new DeviceCardModel(1);
-        u.Start(Settings(unrounded: true), true, T0);
-        var nan = Ok(T0); nan.UnroundedError = "Брутто без округления: NaN/Infinity";
-        u.Apply(nan);
-        Assert.Equal("Брутто без округления: NaN/Infinity · округлённое брутто — в расшифровке журнала", u.View.StateText);
-        var good = Ok(T0.AddSeconds(1)); good.BruttoUnrounded = 1234.56f;
-        u.Apply(good);
-        Assert.Equal(1234.56f.ToString("G9", CultureInfo.CurrentCulture) + " кг", u.View.WeightText);
+        Assert.False(m.View.StableIndicator);
+        Assert.False(m.View.ZeroIndicator);
     }
 
     [Theory]
-    [InlineData(0, "0")]
-    [InlineData(1, "0.5")]
-    [InlineData(2, "0.48")]
-    [InlineData(3, "0.475")]
-    [InlineData(4, "0.4750")]
-    [InlineData(5, "0.47500")]
-    [InlineData(6, "0.475002")]
-    [InlineData(7, "0.4750015")]
-    [InlineData(8, "0.47500150")]
-    public void ManualDigits_RoundUnroundedWeight(int digits, string expected)
+    [InlineData("ru-RU", 0.02f, 10f, "10,000")]
+    [InlineData("en-US", 0.02f, 10f, "10.000")]
+    [InlineData("ru-RU", 0.05f, 10f, "10,000")]
+    [InlineData("en-US", 0.5f, 0.48f, "0.480")]
+    public void Weight_UsesThreePlaces_WithoutReroundingToDivision(
+        string culture, float division, float brutto, string expected)
     {
-        var m = Started(latch: false);
-        m.Digits = digits;
-        var r = Ok(T0);
-        r.Brutto = 0.48f;
-        r.BruttoUnrounded = 0.4750015f;
-        r.Unit = "т";
-        m.Apply(r);
-        Assert.True(m.NeedsUnrounded);
-        Assert.Equal(expected.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " т", m.View.WeightText);
-
-        if (digits >= 4)
+        var previous = CultureInfo.CurrentCulture;
+        try
         {
-            r.BruttoUnrounded = 0.4740019f;
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo(culture);
+            var m = Started(latch: false);
+            var r = Ok(T0);
+            r.Division = division; r.Brutto = brutto; r.Unit = "т";
             m.Apply(r);
-            Assert.NotEqual(expected.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " т", m.View.WeightText);
+            Assert.Equal(expected + " т", m.View.WeightText);
+            Assert.Equal(expected, m.View.Instrument!.BruttoText);
         }
+        finally { CultureInfo.CurrentCulture = previous; }
     }
 
     [Theory]
-    [InlineData(2.5f, "3")]
-    [InlineData(-2.5f, "-3")]
-    public void ManualDigits_MidpointsRoundAwayFromZero(float raw, string expected)
-    {
-        var m = Started(latch: false);
-        m.Digits = 0;
-        var r = Ok(T0);
-        r.BruttoUnrounded = raw;
-        m.Apply(r);
-        Assert.Equal(expected + " кг", m.View.WeightText);
-    }
-
-    [Fact]
-    public void DisplayModeChanges_ApplyToFollowingResponses_AndPreserveLastSnapshot()
+    [InlineData(1.2345f, "1.235")]
+    [InlineData(-1.2345f, "-1.235")]
+    [InlineData(-0.0001f, "0.000")]
+    [InlineData(10f, "10.000")]
+    public void ThreePlaces_MidpointsAndNegativeZero(float raw, string expected)
     {
         var m = Started(latch: false);
         var r = Ok(T0);
-        r.Brutto = 0.48f;
-        r.Unit = "т";
-        Assert.False(m.NeedsUnrounded);
+        r.Brutto = raw;
         m.Apply(r);
-        string original = m.View.WeightText;
-
-        m.Digits = 7;
-        Assert.True(m.NeedsUnrounded);
-        m.Apply(r); // An already in-flight 13-register response.
-        Assert.Equal("Ожидание точных данных", m.View.WeightText);
-        m.Stop(T0.AddSeconds(1), "оператором");
-        Assert.Equal(original, m.View.WeightText);
-        Assert.Equal(Tone.Stale, m.View.WeightTone);
-
-        m.Start(Settings(), false, T0.AddSeconds(2));
-        m.Digits = 7;
-        r.BruttoUnrounded = 0.4750015f;
-        m.Apply(r);
-        string rounded = "0.4750015".Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " т";
-        Assert.Equal(rounded, m.View.WeightText);
-
-        m.DisplayUnrounded = true;
-        m.Apply(r);
-        Assert.Equal(r.BruttoUnrounded.Value.ToString("G9", CultureInfo.CurrentCulture) + " т", m.View.WeightText);
-        m.DisplayUnrounded = false;
-        m.Apply(r);
-        Assert.Equal(rounded, m.View.WeightText);
-        m.Digits = -1;
-        Assert.False(m.NeedsUnrounded);
-        r.BruttoUnrounded = null;
-        m.Apply(r);
-        Assert.Equal(original, m.View.WeightText);
-
-        m.DisplayUnrounded = true;
-        Assert.True(m.NeedsUnrounded);
-        m.Apply(r);
-        Assert.Equal("Ожидание точных данных", m.View.WeightText);
-        m.DisplayUnrounded = false;
-        Assert.False(m.NeedsUnrounded);
-        m.Apply(r);
-        Assert.Equal(original, m.View.WeightText);
+        Assert.Equal(expected.Replace(".", CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator) + " кг", m.View.WeightText);
     }
 
     [Fact]
-    public void DisplayModeChange_DoesNotHideLatchedError()
+    public void Indicators_FollowStatusBits_NotDisplayedNumbers()
+    {
+        var m = Started(latch: false);
+        var r = Ok(T0, status: 2);
+        r.Brutto = r.Netto = 0;
+        m.Apply(r);
+        Assert.True(m.View.StableIndicator);
+        Assert.False(m.View.ZeroIndicator);
+        r.StatusMask = 1; r.Brutto = r.Netto = 1;
+        m.Apply(r);
+        Assert.False(m.View.StableIndicator);
+        Assert.True(m.View.ZeroIndicator);
+    }
+
+    [Theory]
+    [InlineData(0, false, false)]
+    [InlineData(1, false, true)]
+    [InlineData(2, true, false)]
+    [InlineData(3, true, true)]
+    [InlineData(4, false, false)]
+    [InlineData(5, false, true)]
+    [InlineData(6, true, false)]
+    [InlineData(7, true, true)]
+    public void Indicators_DecodeStableAndZeroIndependently(ushort status, bool stable, bool zero)
+    {
+        var m = Started(latch: false);
+        m.Apply(Ok(T0, status: status));
+        Assert.True(m.View.HasLiveIndication);
+        Assert.Equal(stable, m.View.StableIndicator);
+        Assert.Equal(zero, m.View.ZeroIndicator);
+    }
+
+    [Fact]
+    public void Indicators_OffForStaleDataErrorsAndRechecking()
+    {
+        var m = Started();
+        m.Apply(Ok(T0, status: 3));
+        Assert.True(m.View.StableIndicator);
+        Assert.True(m.View.ZeroIndicator);
+        m.Apply(Fail(T0.AddSeconds(1)));
+        Assert.False(m.View.StableIndicator);
+        Assert.False(m.View.ZeroIndicator);
+        m.Stop(T0.AddSeconds(2), "оператором");
+        Assert.False(m.View.HasLiveIndication);
+        m.Start(Settings(), true, T0.AddSeconds(3));
+        Assert.False(m.View.HasLiveIndication);
+        m.Apply(Ok(T0.AddSeconds(4), error: 2, status: 3));
+        Assert.False(m.View.HasLiveIndication);
+        m.Apply(Ok(T0.AddSeconds(5), status: 3));
+        Assert.True(m.View.WeightIsMessage);
+        Assert.False(m.View.StableIndicator);
+        Assert.False(m.View.ZeroIndicator);
+    }
+
+    [Fact]
+    public void LatchedError_HidesIndicators()
     {
         var m = Started();
         for (int i = 0; i < 3; i++) m.Apply(Ok(T0.AddSeconds(i), error: 2));
-        m.DisplayUnrounded = true;
         m.Apply(Ok(T0.AddSeconds(3)));
-        Assert.Equal("Фиксация 0x0002", m.View.WeightText);
+        Assert.Equal("Фиксация Аварии 0x0002", m.View.WeightText);
         Assert.True(m.View.ShowLatchReset);
+        Assert.False(m.View.StableIndicator);
+        Assert.False(m.View.ZeroIndicator);
     }
 
     [Fact]
-    public void ManualDigits_HandlesLargeFiniteWeight()
+    public void Weight_HandlesLargeFiniteWeight()
     {
         var m = Started(latch: false);
-        m.Digits = 8;
         var r = Ok(T0);
-        r.BruttoUnrounded = float.MaxValue;
+        r.Brutto = float.MaxValue;
         m.Apply(r);
         Assert.False(m.View.WeightIsMessage);
         Assert.EndsWith(" кг", m.View.WeightText);
     }
 
     [Fact]
-    public void InvalidUnrounded_IsNotReplacedByRoundedWeight()
+    public void InvalidWeight_IsNotDisplayedAsValid()
     {
         var m = Started(latch: false);
-        m.Digits = 5;
         var r = Ok(T0);
-        r.UnroundedError = "Брутто без округления: NaN/Infinity";
+        r.Brutto = float.NaN;
         m.Apply(r);
         Assert.Equal("Некорректные данные", m.View.WeightText);
         Assert.Equal(Tone.Bad, m.View.WeightTone);
+    }
+
+    [Fact]
+    public void Instrument_FormatsAllFields_AndPreservesSnapshot()
+    {
+        var m = Started(latch: false);
+        var r = Ok(T0);
+        r.Division = 0.02f; r.Brutto = 10; r.Netto = 9; r.Tare = 1;
+        r.Unit = "т"; r.Range = 1; r.ScaleSerialNumber = 45000;
+        r.Ranges = new[] { new ScaleRange(1, 0.4f, 60, 0.02f), new ScaleRange(2, 1, 80, 0.05f) };
+        m.Apply(r);
+        var instrument = m.View.Instrument!;
+        Assert.Equal(r.FormatWeight(9), instrument.NettoText);
+        Assert.Equal(r.FormatWeight(1), instrument.TareText);
+        Assert.Equal(r.FormatWeight(10), instrument.BruttoText);
+        Assert.Equal(r.FormatWeight(0.02f), instrument.DivisionText);
+        Assert.Equal(r.FormatWeight(60), instrument.Ranges[0].MaximumText);
+        Assert.Equal(r.FormatWeight(0.4f), instrument.Ranges[0].MinimumText);
+        Assert.Equal(r.FormatWeight(0.05f), instrument.Ranges[1].DivisionText);
+        Assert.Equal(45000, instrument.ScaleSerialNumber);
+        Assert.True(instrument.IsStable);
+        Assert.False(instrument.IsZero);
+        m.Apply(Fail(T0.AddSeconds(1)));
+        Assert.Equal(instrument, m.View.Instrument);
+        Assert.Equal(Tone.Stale, m.View.WeightTone);
+        m.Stop(T0.AddSeconds(2), "оператором");
+        Assert.Equal(instrument, m.View.Instrument);
+        m.Start(Settings(), false, T0.AddSeconds(3));
+        Assert.Equal(instrument, m.View.Instrument);
+        m.Apply(Ok(T0.AddSeconds(4), error: 2));
+        Assert.True(m.View.Instrument!.IsAlarm);
+        Assert.Equal("Авария", m.View.Instrument.BruttoText);
+    }
+
+    [Fact]
+    public void LegacyDisplaySettings_AreIgnored()
+    {
+        var m = new DeviceCardModel(1);
+        var saved = AppSettings.FromJson("""{"First":{"Ip":"10.0.1.18","ReadUnrounded":true,"Digits":8}}""");
+        var settings = saved.First;
+        m.Start(settings, false, T0);
+        var r = Ok(T0);
+        m.Apply(r);
+        Assert.Equal(Weight(r), m.View.WeightText);
+        Assert.DoesNotContain("ReadUnrounded", saved.ToJson());
     }
 
     [Fact]

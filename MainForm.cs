@@ -31,7 +31,6 @@ namespace M10Modbus
             public Task? Worker;
             public IDisposable? TimerRes;
             public Task? Stopping;
-            public int NeedsUnrounded;
             /// <summary>Incremented on every start/stop; results of a finished polling session are dropped.</summary>
             public int Generation;
             public bool Running => Cts != null;
@@ -39,6 +38,7 @@ namespace M10Modbus
         }
 
         private const int MaxEntries = 5000;
+        internal static readonly Color PanelGrey = Color.FromArgb(0xAC, 0xAC, 0xAC);
         private static readonly Color TxColor = Color.FromArgb(25, 82, 150);
         private static readonly Color RxColor = Color.FromArgb(25, 115, 78);
 
@@ -54,7 +54,6 @@ namespace M10Modbus
             ForeColor = Color.Gainsboro, Font = new Font("Consolas", 9F), BorderStyle = BorderStyle.None };
         private readonly ComboBox _view = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
         private readonly ComboBox _deviceFilter = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 130 };
-        private readonly CheckBox _hold = new CheckBox { Text = "Hold", Appearance = Appearance.Button, AutoSize = true };
         private readonly CheckBox _scroll = new CheckBox { Text = "Автопрокрутка", Checked = true, AutoSize = true, Margin = new Padding(10, 6, 6, 0) };
         private readonly ToolStripStatusLabel _status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
         private readonly ToolTip _tips = new ToolTip();
@@ -75,18 +74,18 @@ namespace M10Modbus
         private bool _allowClose;
         private int _periodMs = 250;
         private int _timeoutMs = 1500;
-        private sealed record LogEntry(int Device, string Kind, string Text, Color Color);
+        private sealed record LogEntry(int Device, LogKind Kind, string Text, Color Color);
 
         public MainForm()
         {
             SuspendLayout();
-            Text = "M10 · Монитор Modbus TCP";
+            Text = "M10 · Монитор Modbus TCP v4.5";
             Font = new Font("Segoe UI", 9F);
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(1200, 850);
             StartPosition = FormStartPosition.CenterScreen;
-            BackColor = SystemColors.Control;
+            BackColor = PanelGrey;
             _runners = new[] { new DeviceRunner(new ScalePanel(1, "10.0.1.18")), new DeviceRunner(new ScalePanel(2, "10.0.1.8")) };
             _stopAll = MakeButton("Остановить всё", async (_, _) => await StopAllAsync());
             BuildLayout();
@@ -96,17 +95,14 @@ namespace M10Modbus
                 DeviceRunner r = runner;
                 r.Panel.PollToggled += (_, _) => OnPollToggled(r);
                 r.Panel.ResetRequested += (_, _) => ApplyEvents(r, r.Model.ResetLatch(DateTime.Now));
-                r.Panel.DigitsChanged += (_, _) => UpdateWeightMode(r);
-                r.Panel.UnroundedChanged += (_, _) => UpdateWeightMode(r);
-                UpdateWeightMode(r);
                 r.Panel.Render(r.Model.View);
             }
             _period.ValueChanged += (_, _) => Volatile.Write(ref _periodMs, (int)_period.Value);
             _timeout.ValueChanged += (_, _) => Volatile.Write(ref _timeoutMs, (int)_timeout.Value);
             _latch.CheckedChanged += (_, _) =>
             {
-                if (_runners.Any(r => r.Running))
-                    _status.Text = $"Фиксация ошибок: {(_latch.Checked ? "вкл" : "выкл")} — применится при следующем включении опроса прибора";
+                foreach (DeviceRunner r in _runners)
+                    ApplyEvents(r, r.Model.SetLatchEnabled(_latch.Checked, DateTime.Now));
             };
             Volatile.Write(ref _periodMs, (int)_period.Value);
             Volatile.Write(ref _timeoutMs, (int)_timeout.Value);
@@ -117,7 +113,9 @@ namespace M10Modbus
 
         private void BuildLayout()
         {
-            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(4) };
+            _split.BackColor = Color.White;
+            _split.Panel1.BackColor = _split.Panel2.BackColor = PanelGrey;
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(4), BackColor = PanelGrey };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -127,31 +125,33 @@ namespace M10Modbus
             toolbar.Margin = Padding.Empty; toolbar.Padding = new Padding(0, 2, 0, 2);
             AddField(toolbar, "Период, мс", _period);
             AddField(toolbar, "Таймаут, мс", _timeout);
-            toolbar.Controls.Add(_latch);
+            toolbar.Controls.Add(Group(_latch));
             _stopAll.Margin = new Padding(12, 3, 3, 3);
-            toolbar.Controls.Add(_stopAll);
+            toolbar.Controls.Add(Group(_stopAll));
             _tips.SetToolTip(_period, "Интервал между запросами текущих показаний (чтение 2000…) одного прибора. Инициализация (1000, 1100…) " +
                 "выполняется подряд без паузы. Если обмен длится дольше периода, следующий запрос уходит сразу, в журнале — «ПРЕВЫШЕН». Применяется сразу.");
             _tips.SetToolTip(_timeout, "Лимит подключения и каждого обмена целиком (запрос + полный ответ). Применяется сразу, со следующего обмена.");
             _tips.SetToolTip(_latch, "После ошибки: 12 чистых ответов до возврата веса. Три ошибки до восстановления фиксируются до ручного снятия. " +
-                "Команды прибору не посылаются. Применяется при следующем включении опроса прибора.");
+                "При выключении фиксация снимается сразу. Команды прибору не посылаются.");
             _tips.SetToolTip(_stopAll, "Выключить опрос обоих приборов. Последние показания остаются на экране серым.");
             root.Controls.Add(toolbar, 0, 0);
 
-            var cards = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+            var cards = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty, BackColor = PanelGrey };
             cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             cards.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             cards.Controls.Add(_runners[0].Panel, 0, 0); cards.Controls.Add(_runners[1].Panel, 1, 0);
             _split.Panel1.Controls.Add(cards);
 
-            var journal = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = Padding.Empty };
+            var journal = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, Margin = Padding.Empty, BackColor = PanelGrey };
             journal.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             journal.RowStyles.Add(new RowStyle(SizeType.AutoSize)); journal.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             var logTools = Flow();
             logTools.Margin = Padding.Empty;
             var title = new Label { Text = "Журнал обмена", AutoSize = true, Margin = new Padding(3, 8, 6, 0) };
             title.Font = new Font(Font, FontStyle.Bold);
-            _view.Items.AddRange(new object[] { "Все записи", "HEX: TX / RX", "Расшифровка", "События" }); _view.SelectedIndex = 0;
+            _view.Items.AddRange(new object[] { "Все записи", "HEX: TX / RX", "Расшифровка", "События", "Показания", "Инициализация" }); _view.SelectedIndex = 0;
+            _tips.SetToolTip(_view, "Расшифровка — показания и настройки; Показания — только числовые ответы весов; " +
+                "Инициализация — запросы, ответы HEX и расшифровка идентификации/конфигурации.");
             _deviceFilter.Items.AddRange(new object[] { "Оба прибора", "Прибор 1", "Прибор 2" }); _deviceFilter.SelectedIndex = 0;
             _view.SelectedIndexChanged += (_, _) => RenderLog(); _deviceFilter.SelectedIndexChanged += (_, _) => RenderLog();
             var clear = MakeButton("Clear · Очистить", (_, _) =>
@@ -165,14 +165,13 @@ namespace M10Modbus
             _tips.SetToolTip(clear, "Очистить экран, буфер отображения и события карточек. Файлы текущей сессии сохраняются без изменений.");
             _tips.SetToolTip(copy, "Копировать выделенный текст; без выделения — весь видимый журнал.");
             _tips.SetToolTip(save, "Экспортировать текущее содержимое экрана. Полные журналы сессий находятся в папке журналов.");
-            _hold.CheckedChanged += (_, _) =>
+            _scroll.CheckedChanged += (_, _) =>
             {
-                foreach (DeviceRunner r in _runners) r.Panel.SetHold(_hold.Checked);
-                if (!_hold.Checked) RenderLog();
+                if (_scroll.Checked) NativeLogScroll.ToBottom(_log);
             };
-            _tips.SetToolTip(_hold, "Зафиксировать журналы на экране. Опрос и полная запись в файлы продолжаются. При снятии Hold выводятся последние 5000 записей.");
-            _tips.SetToolTip(_scroll, "Выключите, чтобы читать предыдущие записи. Запись в файлы и прием пакетов продолжаются.");
-            logTools.Controls.AddRange(new Control[] { title, _view, _deviceFilter, clear, copy, save, folder, _hold, _scroll });
+            _tips.SetToolTip(_scroll, "Выключите, чтобы читать предыдущие записи. Опрос и запись в файлы продолжаются.");
+            foreach (Control control in new Control[] { title, _view, _deviceFilter, clear, copy, save, folder, _scroll })
+                logTools.Controls.Add(Group(control));
             journal.Controls.Add(logTools, 0, 0); journal.Controls.Add(_log, 0, 1);
             _split.Panel2.Controls.Add(journal);
             // Sizes and min sizes of the split are applied only once the window has its real size (ApplySplitter).
@@ -189,24 +188,32 @@ namespace M10Modbus
             };
             root.Controls.Add(_split, 0, 1);
 
-            var strip = new StatusStrip { Dock = DockStyle.Fill, SizingGrip = true }; strip.Items.Add(_status);
+            var strip = new StatusStrip { Dock = DockStyle.Fill, SizingGrip = true, BackColor = PanelGrey }; strip.Items.Add(_status);
             root.Controls.Add(strip, 0, 2);
             Controls.Add(root);
         }
 
         internal static FlowLayoutPanel Flow() => new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true,
-            WrapContents = true, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(0, 2, 0, 2) };
+            WrapContents = true, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(0, 2, 0, 2), BackColor = PanelGrey };
 
         /// <summary>A group that is never split when the parent flow wraps.</summary>
-        internal static FlowLayoutPanel Group(params Control[] controls)
+        internal static TableLayoutPanel Group(params Control[] controls)
         {
-            var group = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                WrapContents = false, Margin = new Padding(6, 0, 0, 0) };
-            group.Controls.AddRange(controls);
+            var group = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                ColumnCount = controls.Length, RowCount = 1, MinimumSize = new Size(0, 35),
+                Margin = new Padding(6, 0, 0, 0), BackColor = PanelGrey };
+            group.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            for (int i = 0; i < controls.Length; i++)
+            {
+                group.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+                controls[i].Anchor = AnchorStyles.Left;
+                controls[i].Margin = new Padding(4, 3, 4, 3);
+                group.Controls.Add(controls[i], i, 0);
+            }
             return group;
         }
 
-        internal static Label FieldLabel(string text) => new Label { Text = text, AutoSize = true, Margin = new Padding(4, 6, 4, 0) };
+        internal static Label FieldLabel(string text) => new Label { Text = text, AutoSize = true, Margin = new Padding(4, 3, 4, 3) };
 
         internal static void AddField(FlowLayoutPanel flow, string label, Control control) => flow.Controls.Add(Group(FieldLabel(label), control));
 
@@ -214,6 +221,20 @@ namespace M10Modbus
         {
             var button = new Button { Text = text, AutoSize = true, MinimumSize = new Size(0, 29), FlatStyle = FlatStyle.System };
             button.Click += action; return button;
+        }
+
+        internal static void StyleToggleButton(CheckBox button)
+        {
+            button.UseVisualStyleBackColor = false;
+            button.FlatStyle = FlatStyle.Flat;
+            button.BackColor = Color.White;
+            button.ForeColor = Color.Black;
+            button.FlatAppearance.CheckedBackColor = Color.White;
+            button.FlatAppearance.MouseOverBackColor = Color.White;
+            button.FlatAppearance.MouseDownBackColor = Color.White;
+            button.FlatAppearance.BorderColor = button.Checked ? Color.RoyalBlue : Color.Silver;
+            button.CheckedChanged += (_, _) =>
+                button.FlatAppearance.BorderColor = button.Checked ? Color.RoyalBlue : Color.Silver;
         }
 
         // ───────────── Window: placement, DPI, splitter ─────────────
@@ -279,7 +300,8 @@ namespace M10Modbus
             _applyingSplitter = true;
             try
             {
-                int width = LogicalToDeviceUnits(6), min1 = LogicalToDeviceUnits(180), min2 = LogicalToDeviceUnits(120);
+                int width = Math.Max(1, (int)Math.Round(3.2 * DeviceDpi / 96.0));
+                int min1 = LogicalToDeviceUnits(180), min2 = LogicalToDeviceUnits(120);
                 int max = _split.Height - min2 - width;
                 if (max < min1) return;
                 if (_split.SplitterWidth != width) _split.SplitterWidth = width;
@@ -331,13 +353,6 @@ namespace M10Modbus
             else _ = StopFromUiAsync(r, "оператором");
         }
 
-        private static void UpdateWeightMode(DeviceRunner r)
-        {
-            r.Model.Digits = r.Panel.Digits;
-            r.Model.DisplayUnrounded = r.Panel.ReadUnrounded;
-            Volatile.Write(ref r.NeedsUnrounded, r.Model.NeedsUnrounded ? 1 : 0);
-        }
-
         private void SetChecked(DeviceRunner r, bool value)
         {
             _suppressToggle = true;
@@ -365,7 +380,6 @@ namespace M10Modbus
             panel.LockSettings(true);
             r.Generation++;
             ApplyEvents(r, r.Model.Start(settings, _latch.Checked, DateTime.Now, (int)_period.Value, (int)_timeout.Value));
-            UpdateWeightMode(r);
             r.TimerRes = TimerResolution.Acquire();
             r.Cts = new CancellationTokenSource();
             int generation = r.Generation;
@@ -442,7 +456,7 @@ namespace M10Modbus
         private async Task RunDeviceAsync(DeviceRunner runner, DeviceSettings s, int generation, CancellationToken ct)
         {
             int device = runner.Number;
-            using var client = new M10ModbusClient(s.Ip.Trim(), s.Port, (byte)s.UnitId, s.Scale, s.ReadUnrounded);
+            using var client = new M10ModbusClient(s.Ip.Trim(), s.Port, (byte)s.UnitId, s.Scale);
             client.Trace += trace => Post(() => AddTrace(device, trace));
             var scheduler = new PollScheduler(Stopwatch.GetTimestamp, Stopwatch.Frequency, Task.Delay);
             int failures = 0;
@@ -455,10 +469,10 @@ namespace M10Modbus
                     scheduler.Period = TimeSpan.FromMilliseconds(period);
                     PollSlotPlan plan = scheduler.NextSlot();
                     await scheduler.WaitAsync(plan, ct);
-                    bool readUnrounded = Volatile.Read(ref runner.NeedsUnrounded) != 0;
-                    M10PollResult result = await client.PollAsync(new PollSlot(period, plan.Overrun), readUnrounded, ct);
+                    M10PollResult result = await client.PollAsync(new PollSlot(period, plan.Overrun), ct);
                     ct.ThrowIfCancellationRequested();
                     Post(() => ApplyResult(device, generation, result));
+                    if (result.RequiresOperatorAction) break;
                     if (result.IsConnected)
                     {
                         failures = 0;
@@ -481,7 +495,8 @@ namespace M10Modbus
             DeviceRunner r = _runners[device - 1];
             if (generation != r.Generation || r.Model.Phase == CardPhase.Off) return;
             (string text, bool isError) = TraceFormatter.FormatData(result, device);
-            AddLog(device, "DATA", text, isError ? Color.Firebrick : Color.DimGray);
+            AddLog(device, result.TransactionId == 0 ? LogKind.Initialization : LogKind.Readings,
+                text, isError ? Color.Firebrick : Color.DimGray);
             ApplyEvents(r, r.Model.Apply(result));
         }
 
@@ -491,7 +506,7 @@ namespace M10Modbus
             foreach (CardEvent e in events)
             {
                 r.Panel.AddEvent(e);
-                AddLog(r.Number, "EVENT", TraceFormatter.FormatEvent(e.Time, r.Number, r.Model.Endpoint, e.Text), ToneColor(e.Tone));
+                AddLog(r.Number, LogKind.Event, TraceFormatter.FormatEvent(e.Time, r.Number, r.Model.Endpoint, e.Text), ToneColor(e.Tone));
             }
             r.Panel.Render(r.Model.View);
         }
@@ -506,7 +521,9 @@ namespace M10Modbus
                 TraceTone.Warning => Color.DarkOrange,
                 _ => Color.Firebrick
             };
-            AddLog(device, "HEX", text, color);
+            AddLog(device, trace.Phase == TracePhase.Poll ? LogKind.Hex : LogKind.InitializationHex, text, color);
+            if (TraceFormatter.FormatInitializationData(trace, device) is { } decoded)
+                AddLog(device, LogKind.Initialization, decoded.Text, decoded.IsError ? Color.Firebrick : Color.DimGray);
         }
 
         internal static Color ToneColor(Tone tone) => tone switch
@@ -547,7 +564,7 @@ namespace M10Modbus
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
             {
                 _journalProblem = ex.Message;
-                AddLog(0, "EVENT", TraceFormatter.FormatSystem(now, "Не удалось создать папку журнала: " + ex.Message), Color.Firebrick);
+                AddLog(0, LogKind.Event, TraceFormatter.FormatSystem(now, "Не удалось создать папку журнала: " + ex.Message), Color.Firebrick);
                 return;
             }
             _journalProblem = null;
@@ -562,18 +579,18 @@ namespace M10Modbus
                     // A late error of an already closed session must not be attributed to the current one.
                     if (!ReferenceEquals(_journal, journal)) return;
                     _status.Text = "Не удалось записать журнал: " + error;
-                    AddLog(0, "EVENT", TraceFormatter.FormatSystem(at, "Ошибка записи журнала: " + error), Color.Firebrick);
+                    AddLog(0, LogKind.Event, TraceFormatter.FormatSystem(at, "Ошибка записи журнала: " + error), Color.Firebrick);
                 });
             });
-            AddLog(0, "EVENT", TraceFormatter.SessionOpened(now, directory), Color.SlateGray);
-            AddLog(0, "EVENT", TraceFormatter.LegendLine(now), Color.SlateGray);
+            AddLog(0, LogKind.Event, TraceFormatter.SessionOpened(now, directory), Color.SlateGray);
+            AddLog(0, LogKind.Event, TraceFormatter.LegendLine(now), Color.SlateGray);
         }
 
         private async Task CloseJournalAsync()
         {
             SessionJournal? journal = _journal;
             if (journal == null) { _status.Text = "Остановлено"; return; }
-            AddLog(0, "EVENT", TraceFormatter.SessionClosed(DateTime.Now), Color.SlateGray);
+            AddLog(0, LogKind.Event, TraceFormatter.SessionClosed(DateTime.Now), Color.SlateGray);
             _journal = null;
             string directory = _sessionDirectory;
             string text;
@@ -588,14 +605,14 @@ namespace M10Modbus
 
         // ───────────── Journal view ─────────────
 
-        private void AddLog(int device, string kind, string text, Color color)
+        private void AddLog(int device, LogKind kind, string text, Color color)
         {
             var entry = new LogEntry(device, kind, text, color);
             _journal?.Write("traffic.txt", text);
-            if (device > 0 && kind == "EVENT") _journal?.Write($"info_device{device}.txt", text);
+            if (device > 0 && kind == LogKind.Event) _journal?.Write($"info_device{device}.txt", text);
             _entries.Enqueue(entry);
             while (_entries.Count > MaxEntries) _entries.Dequeue();
-            if (!_hold.Checked && Matches(entry)) AppendEntry(entry);
+            if (Matches(entry)) AppendEntry(entry);
         }
 
         private static Color LogInk(Color color) => color == Color.Firebrick ? Color.Salmon
@@ -604,7 +621,7 @@ namespace M10Modbus
             : Color.FromArgb(Math.Max(110, (int)color.R), Math.Max(150, (int)color.G), Math.Max(110, (int)color.B));
 
         private bool Matches(LogEntry entry) => (_deviceFilter.SelectedIndex == 0 || entry.Device == _deviceFilter.SelectedIndex || entry.Device == 0) &&
-            (_view.SelectedIndex == 0 || entry.Kind == (_view.SelectedIndex == 1 ? "HEX" : _view.SelectedIndex == 2 ? "DATA" : "EVENT"));
+            LogViewFilter.Includes((LogView)_view.SelectedIndex, entry.Kind);
 
         private void AppendEntry(LogEntry entry)
         {
@@ -638,7 +655,6 @@ namespace M10Modbus
 
         private void RenderLog()
         {
-            if (_hold.Checked) return;
             _log.Clear();
             // Add one block per entry to keep packet pairs readable.
             foreach (var entry in _entries.Where(Matches))
@@ -765,41 +781,95 @@ namespace M10Modbus
 
     public sealed class ScalePanel : GroupBox
     {
-        private readonly CheckBox _poll = new CheckBox { Text = "Опрос", AutoSize = true, Margin = new Padding(3, 5, 6, 0) };
+        private static readonly Color CardGrey = MainForm.PanelGrey;
+        private static readonly Color CardGreyDark = Color.FromArgb(0x97, 0x97, 0x97);
+        private static readonly Color GridWhite = Color.White;
+        private static readonly Color VividBlue = Color.FromArgb(0, 0, 220);
+        private static readonly Color DimInk = Color.FromArgb(120, 120, 120);
+        private static readonly Color LedGreen = Color.FromArgb(185, 235, 25);
+        private static readonly Color LedRed = Color.Red;
+        private static readonly Color LedOff = Color.FromArgb(128, 128, 128);
+
+        private sealed class Led : Control
+        {
+            public Led()
+            {
+                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+                Size = new Size(11, 11); Margin = new Padding(0, 1, 0, 0);
+            }
+
+            private IndicatorState _state;
+
+            public void SetOn(bool on) => SetState(on ? IndicatorState.Green : IndicatorState.Off);
+
+            public void SetState(IndicatorState state) { if (_state != state) { _state = state; Invalidate(); } }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                using var back = new SolidBrush(BackColor); e.Graphics.FillRectangle(back, ClientRectangle);
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                var rect = new Rectangle(0, 0, Width - 1, Height - 1);
+                using var fill = new SolidBrush(_state switch
+                {
+                    IndicatorState.Green => LedGreen,
+                    IndicatorState.Red => LedRed,
+                    _ => LedOff
+                });
+                using var pen = new Pen(Color.FromArgb(70, 70, 70));
+                e.Graphics.FillEllipse(fill, rect); e.Graphics.DrawEllipse(pen, rect);
+            }
+        }
+
+        private readonly CheckBox _poll = new CheckBox { Text = "Начать опрос", Appearance = Appearance.Button, AutoSize = true,
+            MinimumSize = new Size(0, 27), Margin = new Padding(3, 3, 6, 3) };
         private readonly TextBox _ip;
         private readonly NumericUpDown _port = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = 502, Width = 72 };
         private readonly NumericUpDown _uid = new NumericUpDown { Minimum = 0, Maximum = 255, Value = 1, Width = 55 };
         private readonly ComboBox _scale = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 56 };
-        private readonly CheckBox _raw = new CheckBox { Text = "Без округления", AutoSize = true, Margin = new Padding(12, 5, 4, 0) };
-        private readonly ComboBox _digits = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 64 };
+        private readonly Label _serial = new Label { AutoSize = true, Visible = false, ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 7.5F), Margin = new Padding(12, 8, 4, 0) };
         private readonly Label _status = Caption();
-        private readonly Label _weight = new Label { Text = "—", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight,
-            AutoEllipsis = true, BorderStyle = BorderStyle.Fixed3D, Margin = new Padding(0, 2, 0, 2) };
+        private readonly Panel _instrumentHost = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = CardGrey };
+        private readonly Label _message = new Label { Text = "—", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter,
+            AutoEllipsis = true, Margin = Padding.Empty };
+        private readonly TableLayoutPanel _readings;
+        private readonly Panel _rangesHost = new Panel { Dock = DockStyle.Fill, BackColor = GridWhite, Margin = new Padding(1, 0, 1, 0) };
+        private readonly List<(Led Active, Label Number, Label Maximum, Label Minimum, Label Division)> _rangeRows = new();
+        private Led? _aboveMaximumLed;
+        private readonly Label _netto = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight,
+            AutoEllipsis = true, BackColor = CardGrey, Margin = new Padding(1, 1, 1, 1), Padding = new Padding(0, 0, 6, 0) };
+        private readonly Label _tareValue = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight,
+            BackColor = CardGrey, ForeColor = VividBlue, Margin = Padding.Empty };
+        private readonly Label _bruttoValue = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight,
+            BackColor = CardGrey, ForeColor = VividBlue, Margin = Padding.Empty };
+        private readonly Label _unitCaption = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter,
+            AutoEllipsis = true, BackColor = CardGrey, ForeColor = VividBlue, Margin = new Padding(1),
+            Padding = new Padding(4, 0, 4, 0) };
+        private readonly Label _tareCaption = Caption();
+        private readonly Label _bruttoCaption = Caption();
+        private readonly Led _stableLed = new Led { BackColor = CardGrey };
+        private readonly Led _zeroLed = new Led { BackColor = CardGrey };
         private readonly Label _state = Caption();
         private readonly Button _reset;
         private readonly RichTextBox _history = new RichTextBox { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.FixedSingle,
             BackColor = Color.FromArgb(250, 250, 245), DetectUrls = false, Font = new Font("Segoe UI", 9F), MinimumSize = Size.Empty };
         private readonly TableLayoutPanel _layout;
         private readonly TableLayoutPanel _stateRow;
-        private readonly Font _weightFont = new Font("Consolas", 34F, FontStyle.Bold);
-        private readonly Font _messageFont = new Font("Segoe UI", 21F, FontStyle.Bold);
+        private readonly Font _weightFont = new Font("Segoe UI", 32F, FontStyle.Regular);
+        private readonly Font _messageFont = new Font("Segoe UI", 19F, FontStyle.Regular);
+        private readonly Font _subValueFont = new Font("Segoe UI", 20F, FontStyle.Regular);
+        private readonly Font _captionFont = new Font("Segoe UI", 9F, FontStyle.Regular);
+        private readonly Font _rangeFont = new Font("Segoe UI", 9F, FontStyle.Regular);
         private readonly ToolTip _tips = new ToolTip();
-        private readonly Queue<CardEvent> _eventBuffer = new Queue<CardEvent>();
-        private bool _historyHold;
 
         public event EventHandler? PollToggled;
         public event EventHandler? ResetRequested;
-        public event EventHandler? DigitsChanged;
-        public event EventHandler? UnroundedChanged;
 
         public int DeviceNumber { get; }
         public string IpAddress => _ip.Text.Trim();
         public int Port => (int)_port.Value;
         public byte UnitId => (byte)_uid.Value;
         public int ScaleNumber => _scale.SelectedIndex + 1;
-        /// <summary>Digits after the decimal point; −1 = auto.</summary>
-        public int Digits => _digits.SelectedIndex - 1;
-        public bool ReadUnrounded => _raw.Checked;
         public string ConnectionKey => $"{IpAddress}:{Port}/{UnitId}/{ScaleNumber}";
         public bool PollChecked { get => _poll.Checked; set => _poll.Checked = value; }
 
@@ -809,46 +879,39 @@ namespace M10Modbus
         public ScalePanel(int number, string ip)
         {
             DeviceNumber = number;
+            MainForm.StyleToggleButton(_poll);
             Text = "Прибор " + number;
             Dock = DockStyle.Fill;
-            BackColor = SystemColors.Control; Padding = new Padding(6); Margin = new Padding(3);
+            BackColor = CardGrey; Padding = new Padding(6); Margin = new Padding(3);
             _ip = new TextBox { Text = ip, Width = 120 };
             _scale.Items.AddRange(new object[] { "1", "2", "3" }); _scale.SelectedIndex = 0;
-            _digits.Items.Add("Авто"); for (int i = 0; i <= 8; i++) _digits.Items.Add(i.ToString(CultureInfo.InvariantCulture)); _digits.SelectedIndex = 0;
 
-            _poll.Font = new Font(Font, FontStyle.Bold);
             var settings = MainForm.Flow();
-            settings.Margin = Padding.Empty; settings.Padding = Padding.Empty;
+            settings.Margin = Padding.Empty; settings.Padding = Padding.Empty; settings.BackColor = CardGrey;
             var colon = new Label { Text = ":", AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
             var uidLabel = MainForm.FieldLabel("Id");
-            var scaleLabel = MainForm.FieldLabel("Весы");
-            var digitsLabel = MainForm.FieldLabel("Знаков");
+            var scaleLabel = MainForm.FieldLabel("Канал весов");
             settings.Controls.Add(_poll);
             settings.Controls.Add(MainForm.Group(MainForm.FieldLabel("IP"), _ip, colon, _port));
             settings.Controls.Add(MainForm.Group(uidLabel, _uid));
             settings.Controls.Add(MainForm.Group(scaleLabel, _scale));
-            settings.Controls.Add(_raw);
-            settings.Controls.Add(MainForm.Group(digitsLabel, _digits));
 
-            _tips.SetToolTip(_poll, "Включить/выключить опрос этого прибора. Второй прибор не затрагивается. " +
+            _tips.SetToolTip(_poll, "Начать/остановить опрос этого прибора. Второй прибор не затрагивается. " +
                 "Пока опрос включён, IP, порт, Id и весы не редактируются.");
             string uidTip = "Unit Identifier — адрес устройства в запросе Modbus TCP (7-й байт MBAP), та же роль, что адрес в Modbus RTU. " +
                 "Должен совпадать с настройкой прибора.";
             _tips.SetToolTip(uidLabel, uidTip); _tips.SetToolTip(_uid, uidTip);
-            string scaleTip = "Номер весов 1–3: текущие показания читаются с адреса 2000+33·(n−1), конфигурация — 1100+33·(n−1).";
+            string scaleTip = "Канал весов внутри выбранного M10, а не номер карточки программы. " +
+                "«Прибор 2» не означает канал «Весы 2»: если в этом M10 одни весы, выбирайте канал 1. " +
+                "Каналы 2 и 3 выбирайте только при их наличии в приборе. " +
+                "Текущие показания: 2000+33·(n−1), конфигурация: 1100+33·(n−1).";
             _tips.SetToolTip(scaleLabel, scaleTip); _tips.SetToolTip(_scale, scaleTip);
-            _tips.SetToolTip(_raw, "Показывать брутто без округления прибора (2013+33·(n−1)). Применяется со следующего запроса.");
-            string digitsTip = "Авто: округлённое прибором брутто по дискретности d. При выборе числа знаков " +
-                "брутто без округления округляется до этого числа; это не метрологическое округление прибора. Применяется со следующего запроса.";
-            _tips.SetToolTip(digitsLabel, digitsTip); _tips.SetToolTip(_digits, digitsTip);
 
-            _poll.CheckedChanged += (_, _) => PollToggled?.Invoke(this, EventArgs.Empty);
-            _raw.CheckedChanged += (_, _) =>
+            _poll.CheckedChanged += (_, _) =>
             {
-                _digits.Enabled = !_raw.Checked;
-                UnroundedChanged?.Invoke(this, EventArgs.Empty);
+                _poll.Text = _poll.Checked ? "Остановить опрос" : "Начать опрос";
+                PollToggled?.Invoke(this, EventArgs.Empty);
             };
-            _digits.SelectedIndexChanged += (_, _) => DigitsChanged?.Invoke(this, EventArgs.Empty);
 
             _status.Font = new Font(Font, FontStyle.Bold);
             _status.TextAlign = ContentAlignment.MiddleCenter;
@@ -862,27 +925,83 @@ namespace M10Modbus
             _stateRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             _stateRow.Controls.Add(_state, 0, 0); _stateRow.Controls.Add(_reset, 1, 0);
 
-            _weight.Font = _weightFont;
+            _message.Font = _messageFont;
+            _netto.Font = _weightFont; _netto.ForeColor = VividBlue;
+            _tareValue.Font = _subValueFont; _bruttoValue.Font = _subValueFont;
+            _unitCaption.Font = _captionFont;
+            _unitCaption.TextAlign = ContentAlignment.MiddleLeft;
+            _stableLed.Dock = _zeroLed.Dock = DockStyle.None;
+
+            var side = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = GridWhite, Margin = new Padding(0, 1, 1, 1) };
+            side.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            side.RowStyles.Add(new RowStyle(SizeType.Percent, 34)); side.RowStyles.Add(new RowStyle(SizeType.Percent, 32)); side.RowStyles.Add(new RowStyle(SizeType.Percent, 34));
+            side.Controls.Add(LedCell("стаб.", _stableLed), 0, 0);
+            side.Controls.Add(_unitCaption, 0, 1);
+            side.Controls.Add(LedCell("нуль", _zeroLed), 0, 2);
+
+            _readings = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 3, BackColor = GridWhite, Margin = Padding.Empty };
+            _readings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
+            _readings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
+            _readings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 18));
+            _readings.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            _readings.RowStyles.Add(new RowStyle(SizeType.Percent, 25));
+            _readings.RowStyles.Add(new RowStyle(SizeType.Percent, 25));
+            _readings.Controls.Add(_rangesHost, 0, 0); _readings.SetRowSpan(_rangesHost, 3);
+            _readings.Controls.Add(_netto, 1, 0);
+            _readings.Controls.Add(_tareValue, 1, 1);
+            _readings.Controls.Add(_bruttoValue, 1, 2);
+            _readings.Controls.Add(side, 2, 0);
+            _readings.Controls.Add(_tareCaption, 2, 1);
+            _readings.Controls.Add(_bruttoCaption, 2, 2);
+            foreach (Label label in new[] { _tareCaption, _bruttoCaption })
+            {
+                label.BackColor = CardGrey; label.ForeColor = VividBlue;
+                label.Font = _captionFont; label.Margin = new Padding(1);
+            }
+            _tareValue.Margin = _bruttoValue.Margin = new Padding(1);
+            _tareValue.Padding = _bruttoValue.Padding = new Padding(0, 0, 6, 0);
+
+            _instrumentHost.Controls.Add(_readings);
+            _instrumentHost.Controls.Add(_message);
+            _message.BringToFront();
+
             _layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Margin = Padding.Empty };
+            _layout.AutoScroll = true;
             _layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             _layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Font.Height + 8));
-            _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, _weightFont.Height + 16));
+            _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, _weightFont.Height + 16 + 2 * (_subValueFont.Height + 4)));
             _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Font.Height + 10));
             _layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             _layout.Controls.Add(settings, 0, 0);
             _layout.Controls.Add(_status, 0, 1);
-            _layout.Controls.Add(_weight, 0, 2);
+            _layout.Controls.Add(_instrumentHost, 0, 2);
             _layout.Controls.Add(_stateRow, 0, 3);
             _layout.Controls.Add(_history, 0, 4);
             Controls.Add(_layout);
+        }
+
+        private Panel LedCell(string caption, Led led)
+        {
+            var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
+                BackColor = CardGrey, Margin = new Padding(1) };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 15));
+            panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            var label = Caption();
+            label.Text = caption;
+            label.ForeColor = VividBlue;
+            label.Font = _captionFont;
+            led.Anchor = AnchorStyles.None; led.Margin = Padding.Empty;
+            panel.Controls.Add(label, 0, 0); panel.Controls.Add(led, 1, 0);
+            return panel;
         }
 
         internal void CompactRows()
         {
             int stateRow = Font.Height + 10;
             _layout.RowStyles[1].Height = Font.Height + 8;
-            _layout.RowStyles[2].Height = _weightFont.Height + 16;
+            _layout.RowStyles[2].Height = _weightFont.Height + 16 + 2 * (_subValueFont.Height + 4);
             _layout.RowStyles[3].Height = stateRow;
             _reset.AutoSize = false;
             _reset.MinimumSize = Size.Empty;
@@ -909,43 +1028,163 @@ namespace M10Modbus
         {
             (_status.BackColor, _status.ForeColor) = v.StatusTone switch
             {
-                Tone.Info => (Color.LightSteelBlue, Color.Black),
-                Tone.Good => (Color.ForestGreen, Color.White),
-                Tone.Bad => (Color.Crimson, Color.White),
-                Tone.Warn => (Color.Orange, Color.Black),
+                Tone.Info => (CardGrey, Color.Navy),
+                Tone.Good => (CardGrey, VividBlue),
+                Tone.Bad => (CardGrey, Color.Firebrick),
+                Tone.Warn => (CardGrey, Color.FromArgb(110, 70, 0)),
                 _ => (Color.LightGray, Color.Black)
             };
             _status.Text = v.StatusText;
             _tips.SetToolTip(_status, v.StatusTip.Length > 0 ? v.StatusText + Environment.NewLine + v.StatusTip : v.StatusText);
 
-            Font weightFont = v.WeightIsMessage ? _messageFont : _weightFont;
-            if (_weight.Font != weightFont) _weight.Font = weightFont;
-            (_weight.BackColor, _weight.ForeColor) = v.WeightTone switch
+            bool numeric = v.Instrument != null;
+            bool fresh = v.HasFreshInstrument;
+            _stableLed.SetOn(v.StableIndicator);
+            _zeroLed.SetOn(v.ZeroIndicator);
+            _message.Visible = !numeric;
+            _readings.Visible = numeric;
+
+            if (!numeric)
             {
-                Tone.Stale => (Color.FromArgb(48, 48, 48), Color.FromArgb(150, 150, 150)),
-                Tone.Good => (Color.Black, Color.Lime),
-                Tone.Warn => (Color.Black, v.WeightIsMessage ? Color.DarkOrange : Color.Yellow),
-                Tone.Bad => (Color.Black, Color.OrangeRed),
-                _ => (Color.Black, Color.Gainsboro)
-            };
-            _weight.Text = v.WeightText;
+                var (back, fore) = ReadingColors(v.WeightTone);
+                _message.BackColor = back; _message.ForeColor = fore; _message.Text = v.WeightText;
+                _tips.SetToolTip(_message, v.WeightText);
+                _serial.Visible = false;
+            }
+            else
+            {
+                InstrumentView inst = v.Instrument!;
+                var (back, fore) = ReadingColors(v.WeightTone);
+                _netto.Font = inst.IsAlarm ? _messageFont : _weightFont;
+                _netto.BackColor = back; _netto.ForeColor = fore; _netto.Text = inst.NettoText;
+                _tareValue.BackColor = back; _tareValue.ForeColor = fore; _tareValue.Text = inst.TareText;
+                _bruttoValue.BackColor = back; _bruttoValue.ForeColor = fore; _bruttoValue.Text = inst.BruttoText;
+                _unitCaption.Text = "нетто, " + inst.Unit;
+                _tareCaption.Text = "тара, " + inst.Unit;
+                _bruttoCaption.Text = "брутто, " + inst.Unit;
+                int offset = 33 * (inst.ScaleNumber - 1);
+                _tips.SetToolTip(_netto, inst.IsAlarm ? v.WeightText + Environment.NewLine + v.StateText
+                    : $"WS_Netto_d · {2009 + offset} · {inst.NettoText} {inst.Unit}");
+                _tips.SetToolTip(_tareValue, inst.TareIsLastKnown
+                    ? "Последняя корректная тара до аварии; текущие весовые значения недействительны"
+                    : $"WS_Tare_d · {2011 + offset} · {inst.TareText} {inst.Unit}");
+                _tareValue.ForeColor = inst.TareIsLastKnown ? DimInk : fore;
+                _tips.SetToolTip(_bruttoValue, inst.IsAlarm ? v.WeightText + Environment.NewLine + v.StateText
+                    : $"WS_Brutto_d · {2007 + offset} · {inst.BruttoText} {inst.Unit}");
+                _tips.SetToolTip(_unitCaption, $"WS_d_current · {2005 + offset} · d={inst.DivisionText} {inst.Unit}");
+                BuildRangesTable(inst.Ranges, inst.AboveMaximumIndicator, fresh);
+                _serial.Visible = inst.ScaleSerialNumber != 0;
+                _serial.ForeColor = fresh ? VividBlue : DimInk;
+                if (_serial.Visible) _serial.Text = $"Весы {inst.ScaleNumber} · № {inst.ScaleSerialNumber}";
+            }
 
             (_state.BackColor, _state.ForeColor) = v.StateTone switch
             {
-                Tone.Good => (Color.PaleGreen, Color.Black),
-                Tone.Warn => (Color.LightGoldenrodYellow, Color.Black),
-                Tone.Bad => (Color.MistyRose, Color.Firebrick),
-                _ => (SystemColors.Control, Color.DimGray)
+                Tone.Good => (CardGrey, VividBlue),
+                Tone.Warn => (CardGrey, Color.FromArgb(110, 70, 0)),
+                Tone.Bad => (CardGrey, Color.Firebrick),
+                _ => (CardGrey, Color.DimGray)
             };
             _state.Text = v.StateText;
             _tips.SetToolTip(_state, v.StateText);
             _reset.Visible = v.ShowLatchReset;
         }
 
+        private static (Color Back, Color Fore) ReadingColors(Tone tone) => tone switch
+        {
+            Tone.Stale => (CardGreyDark, DimInk),
+            _ => (CardGrey, VividBlue)
+        };
+
+        private void BuildRangesTable(IReadOnlyList<InstrumentRangeView> ranges, IndicatorState aboveMaximum, bool fresh)
+        {
+            if (_aboveMaximumLed == null || _rangeRows.Count != ranges.Count)
+            {
+                _serial.Parent?.Controls.Remove(_serial);
+                foreach (Control child in _rangesHost.Controls.Cast<Control>().ToArray()) child.Dispose();
+                _rangeRows.Clear();
+                var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, RowCount = ranges.Count + 3,
+                    BackColor = GridWhite, Margin = Padding.Empty, Padding = new Padding(1, 0, 1, 0) };
+                foreach (float width in new[] { 8f, 27f, 27f, 28f })
+                    grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, width));
+                grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, _stableLed.Width + 6));
+                for (int i = 0; i < ranges.Count + 2; i++)
+                    grid.RowStyles.Add(new RowStyle(SizeType.Absolute, _rangeFont.Height + 7));
+                grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+                string[] headers = { "", "Max", "Min", "e=d", "" };
+                for (int i = 0; i < headers.Length; i++) grid.Controls.Add(RangeCell(headers[i]), i, 0);
+                var emptyCell = RangeCell("");
+                grid.Controls.Add(emptyCell, 0, 1);
+                grid.SetColumnSpan(emptyCell, 4);
+                var aboveMaximumLed = new Led { BackColor = CardGrey, Size = _stableLed.Size, Margin = Padding.Empty };
+                _aboveMaximumLed = aboveMaximumLed;
+                var aboveMaximumCell = new Panel { Dock = DockStyle.Fill, BackColor = CardGrey, Margin = new Padding(0, 1, 0, 1) };
+                aboveMaximumCell.Controls.Add(aboveMaximumLed);
+                aboveMaximumCell.Resize += (_, _) => aboveMaximumLed.Location = new Point(
+                    Math.Max(0, (aboveMaximumCell.Width - aboveMaximumLed.Width) / 2),
+                    Math.Max(0, (aboveMaximumCell.Height - aboveMaximumLed.Height) / 2));
+                _tips.SetToolTip(aboveMaximumLed, "Вес выше Max последнего диапазона");
+                grid.Controls.Add(aboveMaximumCell, 4, 1);
+                for (int i = 0; i < ranges.Count; i++)
+                {
+                    var led = new Led { BackColor = CardGrey, Anchor = AnchorStyles.Top | AnchorStyles.Left,
+                        Size = _stableLed.Size, Margin = Padding.Empty };
+                    var number = RangeCell("");
+                    var maximum = RangeCell("");
+                    var minimum = RangeCell("");
+                    var division = RangeCell("");
+                    int row = ranges.Count - i + 1;
+                    grid.Controls.Add(number, 0, row);
+                    grid.Controls.Add(maximum, 1, row);
+                    grid.Controls.Add(minimum, 2, row);
+                    grid.Controls.Add(division, 3, row);
+                    var ledCell = new Panel { Dock = DockStyle.Fill, BackColor = CardGrey, Margin = new Padding(0, 1, 0, 1) };
+                    ledCell.Controls.Add(led);
+                    ledCell.Resize += (_, _) => led.Location = new Point(Math.Max(0, (ledCell.Width - led.Width) / 2),
+                        Math.Max(0, (ledCell.Height - led.Height) / 2));
+                    grid.Controls.Add(ledCell, 4, row);
+                    _rangeRows.Add((led, number, maximum, minimum, division));
+                }
+                _serial.BackColor = CardGrey;
+                _serial.Dock = DockStyle.Fill;
+                _serial.Margin = Padding.Empty;
+                grid.Controls.Add(_serial, 0, ranges.Count + 2);
+                grid.SetColumnSpan(_serial, 5);
+                _rangesHost.Controls.Add(grid);
+            }
+            _aboveMaximumLed.Visible = fresh && aboveMaximum != IndicatorState.Off;
+            _aboveMaximumLed.SetState(fresh ? aboveMaximum : IndicatorState.Off);
+            for (int i = 0; i < ranges.Count; i++)
+            {
+                InstrumentRangeView r = ranges[i];
+                var row = _rangeRows[i];
+                row.Number.Text = r.Number.ToString(CultureInfo.InvariantCulture) + ":";
+                row.Maximum.Text = r.MaximumText;
+                row.Minimum.Text = r.MinimumText;
+                row.Division.Text = r.DivisionText;
+                foreach (Label label in new[] { row.Number, row.Maximum, row.Minimum, row.Division })
+                {
+                    label.ForeColor = fresh ? VividBlue : DimInk;
+                    _tips.SetToolTip(label, $"Диапазон {r.Number}: Max={r.MaximumText}, Min={r.MinimumText}, e=d={r.DivisionText}");
+                }
+                row.Active.Size = _stableLed.Size;
+                if (row.Active.Parent is { } ledCell)
+                    row.Active.Location = new Point(Math.Max(0, (ledCell.Width - row.Active.Width) / 2),
+                        Math.Max(0, (ledCell.Height - row.Active.Height) / 2));
+                row.Active.SetState(fresh ? r.Indicator : IndicatorState.Off);
+            }
+        }
+
+        private Label RangeCell(string text) => new Label
+        {
+            Text = text, Dock = DockStyle.Fill, AutoEllipsis = true, Font = _rangeFont,
+            BackColor = CardGrey, ForeColor = VividBlue, TextAlign = ContentAlignment.MiddleRight,
+            Margin = new Padding(0, 1, 0, 1)
+        };
+
         public void AddEvent(CardEvent e)
         {
-            _eventBuffer.Enqueue(e); while (_eventBuffer.Count > 200) _eventBuffer.Dequeue();
-            if (!_historyHold) AppendHistory(e);
+            AppendHistory(e);
         }
 
         private void AppendHistory(CardEvent e)
@@ -956,30 +1195,25 @@ namespace M10Modbus
             NativeLogScroll.ToBottom(_history);
         }
 
-        public void ClearHistory() { _eventBuffer.Clear(); _history.Clear(); }
-
-        public void SetHold(bool hold)
-        {
-            _historyHold = hold;
-            if (hold) return;
-            _history.Clear(); foreach (CardEvent e in _eventBuffer) AppendHistory(e);
-        }
+        public void ClearHistory() => _history.Clear();
 
         public DeviceSettings GetSettings() => new DeviceSettings { Ip = IpAddress, Port = Port, UnitId = UnitId, Scale = ScaleNumber,
-            ReadUnrounded = _raw.Checked, Digits = _digits.SelectedIndex == 0 ? null : _digits.SelectedIndex - 1,
-            UnroundedAddress = (2013 + (ScaleNumber - 1) * 33).ToString(CultureInfo.InvariantCulture) };
+            Digits = null };
 
         public void ApplySettings(DeviceSettings? settings)
         {
             if (settings == null) return;
             _ip.Text = settings.Ip ?? ""; _port.Value = Math.Clamp(settings.Port, 1, 65535);
             _uid.Value = Math.Clamp(settings.UnitId, 0, 255); _scale.SelectedIndex = Math.Clamp(settings.Scale, 1, 3) - 1;
-            _raw.Checked = settings.ReadUnrounded; _digits.SelectedIndex = settings.Digits.HasValue ? Math.Clamp(settings.Digits.Value, 0, 8) + 1 : 0;
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { _tips.Dispose(); _weightFont.Dispose(); _messageFont.Dispose(); }
+            if (disposing)
+            {
+                _tips.Dispose(); _weightFont.Dispose(); _messageFont.Dispose();
+                _subValueFont.Dispose(); _captionFont.Dispose(); _rangeFont.Dispose();
+            }
             base.Dispose(disposing);
         }
     }
