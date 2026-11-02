@@ -79,7 +79,7 @@ namespace M10Modbus
         public MainForm()
         {
             SuspendLayout();
-            Text = "M10 · Монитор Modbus TCP v4.4";
+            Text = "M10 · Монитор Modbus TCP v4.5";
             Font = new Font("Segoe UI", 9F);
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
