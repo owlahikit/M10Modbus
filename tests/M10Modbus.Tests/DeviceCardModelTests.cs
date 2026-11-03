@@ -345,6 +345,47 @@ public class DeviceCardModelTests
         Assert.True(m.View.ZeroIndicator);
     }
 
+    [Fact]
+    public void StateEvents_IncludeGrossWeightAtStatusChangesWithoutLoggingEveryPoll()
+    {
+        var m = Started(latch: false);
+        var first = Ok(T0, status: 2);
+        first.Brutto = 30.4f; first.Netto = 10; first.Tare = 20.4f; first.Unit = "т";
+        var initial = m.Apply(first);
+        Assert.Contains(initial, e => e.Text == $"Брутто: {first.FormatWeight(first.Brutto)} т; Стабильно; вес не ниже Min1; ноль: нет.");
+
+        var unchanged = Ok(T0.AddSeconds(1), status: 2);
+        unchanged.Brutto = 50;
+        Assert.Empty(m.Apply(unchanged));
+
+        var changed = Ok(T0.AddSeconds(2), status: 1);
+        changed.Brutto = 60.8f; changed.Unit = "т";
+        var transition = m.Apply(changed);
+        Assert.Contains(transition, e => e.Text == $"Брутто: {changed.FormatWeight(changed.Brutto)} т; Не стабильно; вес не ниже Min1; ноль: да.");
+        Assert.DoesNotContain(transition, e => e.Text.Contains("Нетто") || e.Text.Contains("Тара"));
+    }
+
+    [Fact]
+    public void StateEvents_DoNotPresentInvalidOrAlarmWeightAsValid()
+    {
+        var m = Started(latch: false);
+        var alarm = Ok(T0, error: 2);
+        alarm.Brutto = 123.45f;
+        var alarmEvents = m.Apply(alarm);
+        Assert.Contains(alarmEvents, e => e.Text.Contains("нагрузка ниже заданного порога"));
+        Assert.DoesNotContain(alarmEvents, e => e.Text.Contains("Брутто"));
+
+        var invalid = Ok(T0.AddSeconds(1));
+        invalid.Brutto = float.NaN;
+        var invalidEvents = m.Apply(invalid);
+        Assert.Contains(invalidEvents, e => e.Text.Contains("Некорректное числовое значение"));
+        Assert.DoesNotContain(invalidEvents, e => e.Text.Contains("Брутто"));
+
+        var recovered = Ok(T0.AddSeconds(2));
+        var recoveredEvents = m.Apply(recovered);
+        Assert.Contains(recoveredEvents, e => e.Text.StartsWith($"Брутто: {recovered.FormatWeight(recovered.Brutto)} кг;"));
+    }
+
     [Theory]
     [InlineData(0, false, false)]
     [InlineData(1, false, true)]

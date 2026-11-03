@@ -58,6 +58,7 @@ namespace M10Modbus
         private readonly ToolStripStatusLabel _status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
         private readonly ToolTip _tips = new ToolTip();
         private readonly Queue<LogEntry> _entries = new Queue<LogEntry>();
+        private readonly Queue<LogEntry> _deferredLogEntries = new Queue<LogEntry>();
         private readonly string _dataRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "M10MbTcp");
         private string SettingsFile => Path.Combine(_dataRoot, "settings.json");
         private SessionJournal? _journal;
@@ -72,6 +73,8 @@ namespace M10Modbus
         private bool _suppressToggle;
         private bool _closing;
         private bool _allowClose;
+        private bool _selectingLog;
+        private bool _deferredLogOverflow;
         private int _periodMs = 250;
         private int _timeoutMs = 1500;
         private sealed record LogEntry(int Device, LogKind Kind, string Text, Color Color);
@@ -156,7 +159,7 @@ namespace M10Modbus
             _view.SelectedIndexChanged += (_, _) => RenderLog(); _deviceFilter.SelectedIndexChanged += (_, _) => RenderLog();
             var clear = MakeButton("Clear · Очистить", (_, _) =>
             {
-                _entries.Clear(); _log.Clear();
+                _entries.Clear(); _deferredLogEntries.Clear(); _deferredLogOverflow = false; _log.Clear();
                 foreach (DeviceRunner r in _runners) r.Panel.ClearHistory();
             });
             var copy = MakeButton("Копировать", (_, _) => CopyLog());
@@ -168,6 +171,18 @@ namespace M10Modbus
             _scroll.CheckedChanged += (_, _) =>
             {
                 if (_scroll.Checked) NativeLogScroll.ToBottom(_log);
+            };
+            _log.MouseDown += (_, e) =>
+            {
+                if (e.Button == MouseButtons.Left) _selectingLog = true;
+            };
+            _log.MouseUp += (_, e) =>
+            {
+                if (e.Button == MouseButtons.Left) FinishLogSelection();
+            };
+            _log.MouseCaptureChanged += (_, _) =>
+            {
+                if (!_log.Capture) FinishLogSelection();
             };
             _tips.SetToolTip(_scroll, "Выключите, чтобы читать предыдущие записи. Опрос и запись в файлы продолжаются.");
             foreach (Control control in new Control[] { title, _view, _deviceFilter, clear, copy, save, folder, _scroll })
@@ -612,7 +627,17 @@ namespace M10Modbus
             if (device > 0 && kind == LogKind.Event) _journal?.Write($"info_device{device}.txt", text);
             _entries.Enqueue(entry);
             while (_entries.Count > MaxEntries) _entries.Dequeue();
-            if (Matches(entry)) AppendEntry(entry);
+            if (!Matches(entry)) return;
+            if ((_selectingLog && !_scroll.Checked) || _deferredLogEntries.Count > 0 || _deferredLogOverflow)
+            {
+                if (!_deferredLogOverflow)
+                {
+                    if (_deferredLogEntries.Count < MaxEntries) _deferredLogEntries.Enqueue(entry);
+                    else { _deferredLogEntries.Clear(); _deferredLogOverflow = true; }
+                }
+                return;
+            }
+            AppendEntries(new[] { entry });
         }
 
         private static Color LogInk(Color color) => color == Color.Firebrick ? Color.Salmon
@@ -623,38 +648,84 @@ namespace M10Modbus
         private bool Matches(LogEntry entry) => (_deviceFilter.SelectedIndex == 0 || entry.Device == _deviceFilter.SelectedIndex || entry.Device == 0) &&
             LogViewFilter.Includes((LogView)_view.SelectedIndex, entry.Kind);
 
-        private void AppendEntry(LogEntry entry)
+        private void FinishLogSelection()
         {
-            // Preserve selection/scroll while inspecting history. ScrollToCaret only on explicit autoscroll.
+            if (!_selectingLog) return;
+            _selectingLog = false;
+            if (IsDisposed || Disposing || !IsHandleCreated) return;
+            BeginInvoke((Action)(() =>
+            {
+                if (_selectingLog || IsDisposed || Disposing) return;
+                if (_deferredLogOverflow)
+                {
+                    RenderLog();
+                    _status.Text = "Журнал обновлён: показаны последние записи; проверьте полный журнал в файле.";
+                }
+                else if (_deferredLogEntries.Count > 0)
+                {
+                    AppendEntries(_deferredLogEntries);
+                    _deferredLogEntries.Clear();
+                }
+            }));
+        }
+
+        private void AppendEntries(IEnumerable<LogEntry> entries)
+        {
+            bool preserveView = !_scroll.Checked;
+            bool suppressRedraw = preserveView && _log.Visible;
             int firstLine = (int)SendMessage(_log.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
             int selection = _log.SelectionStart, length = _log.SelectionLength;
-            _log.Select(_log.TextLength, 0); _log.SelectionColor = LogInk(entry.Color);
-            _log.AppendText(entry.Text + Environment.NewLine);
-            if (_log.TextLength > 400000)
+            var scrollPosition = Point.Empty;
+            if (preserveView)
             {
-                string visible = _log.Text;
-                int lineEnd = visible.IndexOf('\n', 100000);
-                int cut = lineEnd >= 0 ? lineEnd + 1 : 100000;
-                int removedLines = visible.Take(cut).Count(c => c == '\n');
-                LogTextBox.RemovePrefix(_log, cut);
-                selection = Math.Max(0, selection - cut);
-                length = Math.Min(length, _log.TextLength - selection);
-                firstLine = Math.Max(0, firstLine - removedLines);
+                SendMessage(_log.Handle, 0x04DD, IntPtr.Zero, ref scrollPosition); // EM_GETSCROLLPOS
+                if (suppressRedraw) SendMessage(_log.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero); // WM_SETREDRAW
             }
-            if (_scroll.Checked) NativeLogScroll.ToBottom(_log);
-            else
+            try
             {
-                _log.Select(selection, length);
-                int now = (int)SendMessage(_log.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
-                SendMessage(_log.Handle, 0x00B6, IntPtr.Zero, (IntPtr)(firstLine - now));
+                foreach (LogEntry entry in entries)
+                {
+                    _log.Select(_log.TextLength, 0); _log.SelectionColor = LogInk(entry.Color);
+                    _log.AppendText(entry.Text + Environment.NewLine);
+                    if (_log.TextLength <= 400000) continue;
+                    string visible = _log.Text;
+                    int lineEnd = visible.IndexOf('\n', 100000);
+                    int cut = lineEnd >= 0 ? lineEnd + 1 : 100000;
+                    int removedLines = visible.Take(cut).Count(c => c == '\n');
+                    LogTextBox.RemovePrefix(_log, cut);
+                    selection = Math.Max(0, selection - cut);
+                    length = Math.Min(length, _log.TextLength - selection);
+                    firstLine = Math.Max(0, firstLine - removedLines);
+                }
+                if (!preserveView) NativeLogScroll.ToBottom(_log);
+                else
+                {
+                    _log.Select(selection, length);
+                    SendMessage(_log.Handle, 0x04DE, IntPtr.Zero, ref scrollPosition); // EM_SETSCROLLPOS
+                    int now = (int)SendMessage(_log.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+                    SendMessage(_log.Handle, 0x00B6, IntPtr.Zero, (IntPtr)(firstLine - now));
+                }
+            }
+            finally
+            {
+                if (suppressRedraw)
+                {
+                    SendMessage(_log.Handle, 0x000B, (IntPtr)1, IntPtr.Zero);
+                    _log.Invalidate();
+                }
             }
         }
 
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam);
 
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wparam, ref Point lparam);
+
         private void RenderLog()
         {
+            _deferredLogEntries.Clear();
+            _deferredLogOverflow = false;
             _log.Clear();
             // Add one block per entry to keep packet pairs readable.
             foreach (var entry in _entries.Where(Matches))
