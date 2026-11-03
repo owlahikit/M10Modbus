@@ -175,7 +175,8 @@ namespace M10Modbus
                 _lastEventKey = eventKey;
                 Event(r.HasScaleError ? r.GetMetrologicalErrorDescription()
                     : !r.HasValidWeight ? "Некорректное числовое значение или дискретность d."
-                    : $"{(r.IsStable ? "Стабильно" : "Не стабильно")}; {(r.IsBelowMinimum ? "вес ниже Min1" : "вес не ниже Min1")}; ноль: {YesNo(r.IsZero)}.",
+                    : $"Брутто: {r.FormatWeight(r.Brutto)} {r.Unit}; {(r.IsStable ? "Стабильно" : "Не стабильно")}; " +
+                      $"{(r.IsBelowMinimum ? "вес ниже Min1" : "вес не ниже Min1")}; ноль: {YesNo(r.IsZero)}.",
                     invalid ? Tone.Bad : Tone.Neutral);
             }
 
