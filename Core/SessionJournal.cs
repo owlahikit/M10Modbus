@@ -1,5 +1,6 @@
 using System.Text;
 using System.Threading.Channels;
+using System.Globalization;
 
 namespace M10Modbus
 {
@@ -7,6 +8,32 @@ namespace M10Modbus
     // At <= 10 polls/s per device this stays small on a healthy local disk.
     public sealed class SessionJournal : IAsyncDisposable
     {
+        public static string CreateSessionDirectory(string root, DateTime time)
+        {
+            Directory.CreateDirectory(root);
+            string temporary = Path.Combine(root, ".session-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(temporary);
+            try
+            {
+                // A nonempty destination cannot be replaced by a concurrent rename on Unix.
+                File.WriteAllText(Path.Combine(temporary, "traffic.txt"), "");
+                while (true)
+                {
+                    string directory = Path.Combine(root, time.ToString("yyyy-MM-dd_HH-mm-ss-fff", CultureInfo.InvariantCulture));
+                    try { Directory.Move(temporary, directory); return directory; }
+                    catch (IOException) when (Directory.Exists(directory)) { time = time.AddMilliseconds(1); }
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(temporary))
+                {
+                    File.Delete(Path.Combine(temporary, "traffic.txt"));
+                    Directory.Delete(temporary);
+                }
+            }
+        }
+
         private readonly Channel<(string File, string Text)> _queue = Channel.CreateUnbounded<(string, string)>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
         private Task _writer = Task.CompletedTask;

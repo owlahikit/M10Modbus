@@ -5,7 +5,7 @@ namespace M10Modbus.Tests;
 /// <summary>Line formats of design.md 4.1–4.6 (exact samples of 4.3).</summary>
 public class TraceFormatterTests
 {
-    private static readonly string Indent = new(' ', 25);
+    private static string Indent(int id) => new(' ', 27 + id.ToString(CultureInfo.InvariantCulture).Length);
     private static readonly string NL = Environment.NewLine;
 
     private static DateTime T(string hhmmssfff) =>
@@ -32,51 +32,64 @@ public class TraceFormatterTests
     };
 
     [Fact]
+    public void JournalNumber_ChangesLabelAndHexIndent_NotActualModbusBytes()
+    {
+        var trace = TraceFormatter.Format(Tx("21:47:31.140", 1, 1000, 9, TracePhase.Identification), 2);
+        string numbered = TraceFormatter.WithJournalNumber(trace.Text, 12345);
+        Assert.StartsWith("12345: 21:47:31.140 [Прибор 2] TX ", numbered);
+        Assert.Contains(NL + Indent(12345) + "00 01 00 00 00 06 → 01 03 03 E8 00 09", numbered);
+        Assert.Equal(trace.Text, TraceFormatter.WithJournalNumber(numbered, 1));
+        Assert.Throws<ArgumentException>(() => TraceFormatter.WithJournalNumber("нет номера", 1));
+        var result = new M10PollResult { IsConnected = true, TransactionId = 0, Division = 0.02f };
+        Assert.StartsWith("70000: ", TraceFormatter.WithJournalNumber(TraceFormatter.FormatData(result, 1).Text, 70000));
+    }
+
+    [Fact]
     public void Init_TxRx_MatchSamples()
     {
         var tx1 = TraceFormatter.Format(Tx("21:47:31.140", 1, 1000, 9, TracePhase.Identification), 1);
-        Assert.Equal("21:47:31.140 [Прибор 1] TX №1 Id=1 FC=03 адрес=1000 (0x03E8) регистров=9 (0x0009) · ИНИЦИАЛИЗАЦИЯ 1/2: идентификация (тип, SN, FW, порядок слов)"
-            + NL + Indent + "00 01 00 00 00 06 → 01 03 03 E8 00 09", tx1.Text);
+        Assert.Equal("1: 21:47:31.140 [Прибор 1] TX Id=1 FC=03 адрес=1000 (0x03E8) регистров=9 (0x0009) · ИНИЦИАЛИЗАЦИЯ 1/2: идентификация (тип, SN, FW, порядок слов)"
+            + NL + Indent(1) + "00 01 00 00 00 06 → 01 03 03 E8 00 09", tx1.Text);
         Assert.Equal(TraceTone.Tx, tx1.Tone);
 
         var rx1 = TraceFormatter.Format(Rx("21:47:31.152", 1,
             "00 01 00 00 00 15 01 03 12 00 64 30 39 00 01 00 05 00 00 00 00 00 00 00 00 00 00", 11.8, start: 1000, count: 9), 1);
-        Assert.Equal("21:47:31.152 [Прибор 1] RX №1 Id=1 FC=03 байт данных=18 (0x12) · на запрос №1 · ответ через 11,8 мс"
-            + NL + Indent + "00 01 00 00 00 15 → 01 03 12 00 64 30 39 00 01 00 05 00 00 00 00 00 00 00 00 00 00", rx1.Text);
+        Assert.Equal("1: 21:47:31.152 [Прибор 1] RX Id=1 FC=03 байт данных=18 (0x12) · ответ через 11,8 мс"
+            + NL + Indent(1) + "00 01 00 00 00 15 → 01 03 12 00 64 30 39 00 01 00 05 00 00 00 00 00 00 00 00 00 00", rx1.Text);
         Assert.Equal(TraceTone.Rx, rx1.Tone);
 
         var tx2 = TraceFormatter.Format(Tx("21:47:31.153", 2, 1100, 4, TracePhase.ScaleConfig), 1);
-        Assert.Equal("21:47:31.153 [Прибор 1] TX №2 Id=1 FC=03 адрес=1100 (0x044C) регистров=4 (0x0004) · ИНИЦИАЛИЗАЦИЯ 2/2: конфигурация весов 1 (SN весов, единица)"
-            + NL + Indent + "00 02 00 00 00 06 → 01 03 04 4C 00 04", tx2.Text);
+        Assert.Equal("2: 21:47:31.153 [Прибор 1] TX Id=1 FC=03 адрес=1100 (0x044C) регистров=4 (0x0004) · ИНИЦИАЛИЗАЦИЯ 2/2: конфигурация весов 1 (SN весов, единица)"
+            + NL + Indent(2) + "00 02 00 00 00 06 → 01 03 04 4C 00 04", tx2.Text);
 
         var rx2 = TraceFormatter.Format(Rx("21:47:31.164", 2, "00 02 00 00 00 0B 01 03 08 00 7B 00 00 00 00 00 00", 10.9, start: 1100, count: 4), 1);
-        Assert.Equal("21:47:31.164 [Прибор 1] RX №2 Id=1 FC=03 байт данных=8 (0x08) · на запрос №2 · ответ через 10,9 мс"
-            + NL + Indent + "00 02 00 00 00 0B → 01 03 08 00 7B 00 00 00 00 00 00", rx2.Text);
+        Assert.Equal("2: 21:47:31.164 [Прибор 1] RX Id=1 FC=03 байт данных=8 (0x08) · ответ через 10,9 мс"
+            + NL + Indent(2) + "00 02 00 00 00 0B → 01 03 08 00 7B 00 00 00 00 00 00", rx2.Text);
     }
 
     [Fact]
     public void ScaleConfig_Scale2_Uses1133()
     {
         var tx = TraceFormatter.Format(Tx("21:47:31.153", 2, 1133, 4, TracePhase.ScaleConfig, scale: 2), 2);
-        Assert.Equal("21:47:31.153 [Прибор 2] TX №2 Id=1 FC=03 адрес=1133 (0x046D) регистров=4 (0x0004) · ИНИЦИАЛИЗАЦИЯ 2/2: конфигурация весов 2 (SN весов, единица)"
-            + NL + Indent + "00 02 00 00 00 06 → 01 03 04 6D 00 04", tx.Text);
+        Assert.Equal("2: 21:47:31.153 [Прибор 2] TX Id=1 FC=03 адрес=1133 (0x046D) регистров=4 (0x0004) · ИНИЦИАЛИЗАЦИЯ 2/2: конфигурация весов 2 (SN весов, единица)"
+            + NL + Indent(2) + "00 02 00 00 00 06 → 01 03 04 6D 00 04", tx.Text);
     }
 
     [Fact]
     public void PollTx_FirstAfterInit_Period_Overrun()
     {
         var first = TraceFormatter.Format(Tx("21:47:31.165", 3, 2000, 13, TracePhase.Poll), 1);
-        Assert.Equal("21:47:31.165 [Прибор 1] TX №3 Id=1 FC=03 адрес=2000 (0x07D0) регистров=13 (0x000D) · показания · первый после инициализации"
-            + NL + Indent + "00 03 00 00 00 06 → 01 03 07 D0 00 0D", first.Text);
+        Assert.Equal("3: 21:47:31.165 [Прибор 1] TX Id=1 FC=03 адрес=2000 (0x07D0) регистров=13 (0x000D) · показания · первый после инициализации"
+            + NL + Indent(3) + "00 03 00 00 00 06 → 01 03 07 D0 00 0D", first.Text);
 
         var periodic = TraceFormatter.Format(Tx("21:47:35.677", 21, 2000, 13, TracePhase.Poll, period: 1000.3, planned: 1000), 1);
-        Assert.Equal("21:47:35.677 [Прибор 1] TX №21 Id=1 FC=03 адрес=2000 (0x07D0) регистров=13 (0x000D) · показания · период 1000,3 мс"
-            + NL + Indent + "00 15 00 00 00 06 → 01 03 07 D0 00 0D", periodic.Text);
+        Assert.Equal("21: 21:47:35.677 [Прибор 1] TX Id=1 FC=03 адрес=2000 (0x07D0) регистров=13 (0x000D) · показания · период 1000,3 мс"
+            + NL + Indent(21) + "00 15 00 00 00 06 → 01 03 07 D0 00 0D", periodic.Text);
         Assert.Equal(TraceTone.Tx, periodic.Tone);
 
         var overrun = TraceFormatter.Format(Tx("21:47:45.043", 30, 2000, 13, TracePhase.Poll, period: 1043.7, planned: 1000, overrun: true), 1);
-        Assert.Equal("21:47:45.043 [Прибор 1] TX №30 Id=1 FC=03 адрес=2000 (0x07D0) регистров=13 (0x000D) · показания · период 1043,7 мс · ПРЕВЫШЕН (задан 1000 мс)"
-            + NL + Indent + "00 1E 00 00 00 06 → 01 03 07 D0 00 0D", overrun.Text);
+        Assert.Equal("30: 21:47:45.043 [Прибор 1] TX Id=1 FC=03 адрес=2000 (0x07D0) регистров=13 (0x000D) · показания · период 1043,7 мс · ПРЕВЫШЕН (задан 1000 мс)"
+            + NL + Indent(30) + "00 1E 00 00 00 06 → 01 03 07 D0 00 0D", overrun.Text);
         Assert.Equal(TraceTone.Warning, overrun.Tone);
     }
 
@@ -86,23 +99,23 @@ public class TraceFormatterTests
         const string hex = "00 15 00 00 00 1D 01 03 1A 67 20 1A 2B 00 00 00 02 00 01 3F 00 00 00 44 9A 50 00 44 9A 50 00 00 00 00 00";
         Assert.Equal(35, Hex(hex).Length);
         var rx = TraceFormatter.Format(Rx("21:47:35.703", 21, hex, 26.1), 1);
-        Assert.Equal("21:47:35.703 [Прибор 1] RX №21 Id=1 FC=03 байт данных=26 (0x1A) · на запрос №21 · ответ через 26,1 мс"
-            + NL + Indent + "00 15 00 00 00 1D → 01 03 1A 67 20 1A 2B 00 00 00 02 00 01 3F 00 00 00 44 9A 50 00 44 9A 50 00 00 00 00 00", rx.Text);
+        Assert.Equal("21: 21:47:35.703 [Прибор 1] RX Id=1 FC=03 байт данных=26 (0x1A) · ответ через 26,1 мс"
+            + NL + Indent(21) + "00 15 00 00 00 1D → 01 03 1A 67 20 1A 2B 00 00 00 02 00 01 3F 00 00 00 44 9A 50 00 44 9A 50 00 00 00 00 00", rx.Text);
     }
 
     [Fact]
     public void Rx_TidMismatch_ShowsBothNumbers()
     {
         var rx = TraceFormatter.Format(Rx("21:47:35.703", 21, "00 16 00 00 00 1D 01 03 1A", 5.0), 1);
-        Assert.StartsWith("21:47:35.703 [Прибор 1] RX №22 Id=1 FC=03 байт данных=26 (0x1A) · на запрос №21 · ответ через 5,0 мс", rx.Text);
+        Assert.StartsWith("21: 21:47:35.703 [Прибор 1] RX Id=1 FC=03 байт данных=26 (0x1A) · номер ответа=22 · ответ через 5,0 мс", rx.Text);
     }
 
     [Fact]
     public void Rx_Exception83_Code02()
     {
         var rx = TraceFormatter.Format(Rx("21:47:36.690", 22, "00 16 00 00 00 03 01 83 02", 12.4), 1);
-        Assert.Equal("21:47:36.690 [Прибор 1] RX №22 Id=1 FC=83 ИСКЛЮЧЕНИЕ к FC=03: код 02 — недопустимый адрес регистра · на запрос №22 · ответ через 12,4 мс"
-            + NL + Indent + "00 16 00 00 00 03 → 01 83 02", rx.Text);
+        Assert.Equal("22: 21:47:36.690 [Прибор 1] RX Id=1 FC=83 ИСКЛЮЧЕНИЕ к FC=03: код 02 — недопустимый адрес регистра · ответ через 12,4 мс"
+            + NL + Indent(22) + "00 16 00 00 00 03 → 01 83 02", rx.Text);
         Assert.Equal(TraceTone.Error, rx.Tone);
     }
 
@@ -111,20 +124,20 @@ public class TraceFormatterTests
     {
         var part = TraceFormatter.Format(Rx("21:47:39.180", 23, "00 17 00 00 00 1D 01 03 1A", 1500.0, complete: false, expected: 35,
             note: "нет полного ответа за 1500 мс"), 1);
-        Assert.Equal("21:47:39.180 [Прибор 1] RX НЕПОЛНЫЙ №23 получено 9 из 35 байт · на запрос №23 · прервано через 1500,0 мс: нет полного ответа за 1500 мс"
-            + NL + Indent + "00 17 00 00 00 1D → 01 03 1A", part.Text);
+        Assert.Equal("23: 21:47:39.180 [Прибор 1] RX НЕПОЛНЫЙ получено 9 из 35 байт · прервано через 1500,0 мс: нет полного ответа за 1500 мс"
+            + NL + Indent(23) + "00 17 00 00 00 1D → 01 03 1A", part.Text);
         Assert.Equal(TraceTone.Error, part.Tone);
 
         var four = TraceFormatter.Format(Rx("21:47:41.200", 24, "00 18 00 00", 3.2, complete: false, note: "прибор закрыл TCP-соединение"), 1);
-        Assert.Equal("21:47:41.200 [Прибор 1] RX НЕПОЛНЫЙ №24 получено 4 байт (длина неизвестна) · на запрос №24 · прервано через 3,2 мс: прибор закрыл TCP-соединение"
-            + NL + Indent + "00 18 00 00", four.Text);
+        Assert.Equal("24: 21:47:41.200 [Прибор 1] RX НЕПОЛНЫЙ получено 4 байт (длина неизвестна) · прервано через 3,2 мс: прибор закрыл TCP-соединение"
+            + NL + Indent(24) + "00 18 00 00", four.Text);
 
         var one = TraceFormatter.Format(Rx("21:47:41.200", 24, "00", 3.2, complete: false, note: "x"), 1);
         Assert.DoesNotContain("№24 получено", one.Text);
         Assert.Contains("RX НЕПОЛНЫЙ получено 1 байт (длина неизвестна)", one.Text);
 
         var none = TraceFormatter.Format(Rx("21:47:44.700", 25, "", 1500.0, complete: false, note: "нет полного ответа за 1500 мс"), 1);
-        Assert.Equal("21:47:44.700 [Прибор 1] RX НЕТ ОТВЕТА · на запрос №25 · прервано через 1500,0 мс: нет полного ответа за 1500 мс", none.Text);
+        Assert.Equal("25: 21:47:44.700 [Прибор 1] RX НЕТ ОТВЕТА · прервано через 1500,0 мс: нет полного ответа за 1500 мс", none.Text);
         Assert.Equal(TraceTone.Error, none.Tone);
     }
 
@@ -151,7 +164,7 @@ public class TraceFormatterTests
             Assert.Equal("0,1", TraceFormatter.FormatMs(0.1));
             var tx = TraceFormatter.Format(Tx("21:47:35.677", 21, 2000, 13, TracePhase.Poll, period: 1000.3), 1);
             Assert.Contains("период 1000,3 мс", tx.Text);
-            Assert.StartsWith("21:47:35.677 [Прибор 1] ", tx.Text);
+            Assert.StartsWith("21: 21:47:35.677 [Прибор 1] ", tx.Text);
         }
         finally { CultureInfo.CurrentCulture = saved; }
     }
@@ -185,7 +198,7 @@ public class TraceFormatterTests
             Brutto = 1234.5f, Netto = 1234.5f, Tare = 0, Unit = "кг", Division = 0.5f, Range = 1, MeasurementUnixTime = 1730228779
         };
         var (text, isError) = TraceFormatter.FormatData(r, 1);
-        Assert.Equal("21: 21:47:35.703 [Прибор 1] Весы 1: Брутто=1234.5 Нетто=1234.5 Тара=0 кг d=0.5 | Диапазон=1 | Stable=1 Zero=0 BelowMin=0 | Ошибок нет", text);
+        Assert.Equal("21: 21:47:35.703 [Прибор 1] Весы 1: Брутто=1234.500 Нетто=1234.500 Тара=0.000 кг d=0.500 | Диапазон=1 | Stable=1 Zero=0 BelowMin=0 | Ошибок нет", text);
         Assert.False(isError);
 
         var failed = new M10PollResult { Timestamp = T("21:47:44.700"), ConnectionError = "Нет полного ответа за 1500 мс (адрес 2000, слов 13, получено 0 байт)." };
@@ -204,8 +217,69 @@ public class TraceFormatterTests
             Range = 2, MeasurementUnixTime = 1793643944
         };
         var (text, isError) = TraceFormatter.FormatData(r, 2);
-        Assert.Equal("1474: 18:36:07.701 [Прибор 2] Весы 1: Брутто=75.5999985 Нетто=75.5999985 Тара=0 т d=0.0500000007 | Диапазон=2 | Stable=1 Zero=0 BelowMin=0 | Ошибок нет", text);
+        Assert.Equal("1474: 18:36:07.701 [Прибор 2] Весы 1: Брутто=75.600 Нетто=75.600 Тара=0.000 т d=0.050 | Диапазон=2 | Stable=1 Zero=0 BelowMin=0 | Ошибок нет", text);
         Assert.False(isError);
+    }
+
+    [Theory]
+    [InlineData("ru-RU")]
+    [InlineData("en-US")]
+    public void Data_UsesThreeDecimalsWithoutRoundingByDivision(string culture)
+    {
+        var saved = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo(culture);
+            var r = new M10PollResult
+            {
+                IsConnected = true, TransactionId = 0, ExchangeId = Guid.NewGuid(),
+                Brutto = 0.025f, Netto = -0.0004f, Tare = 1.2345f, Division = 0.02f, Unit = "т"
+            };
+            string text = TraceFormatter.FormatData(r, 1).Text;
+            Assert.StartsWith("0: ", text);
+            Assert.Contains("Брутто=0.025 Нетто=0.000 Тара=1.235 т d=0.020", text);
+            Assert.Equal("0.001", M10PollResult.FormatNumber(0.0005f, CultureInfo.InvariantCulture));
+            r.Division = float.NaN;
+            Assert.Contains("d=NaN", TraceFormatter.FormatData(r, 1).Text);
+            Assert.True(TraceFormatter.FormatData(r, 1).IsError);
+            r.IsConnected = false;
+            r.ConnectionError = "нет ответа";
+            Assert.StartsWith("0: ", TraceFormatter.FormatData(r, 1).Text);
+        }
+        finally { CultureInfo.CurrentCulture = saved; }
+    }
+
+    [Fact]
+    public void Readings_RetainFloatPrecision_AndNavigateToTheSameDecodedAnswer()
+    {
+        var r = new M10PollResult
+        {
+            Timestamp = T("18:36:07.701"), IsConnected = true, TransactionId = 1474,
+            ExchangeId = Guid.NewGuid(), Brutto = 75.6f, Netto = -12.3456f,
+            Tare = 0.1f, Division = 0.02f, Unit = "т", Range = 2, StatusMask = 2
+        };
+        var decoded = TraceFormatter.FormatData(r, 2);
+        var raw = TraceFormatter.FormatData(r, 2, rawValues: true);
+        Assert.Contains("Брутто=75.5999985 Нетто=-12.3456001 Тара=0.100000001 т d=0.0199999996", raw.Text);
+        Assert.Contains("Брутто=75.600 Нетто=-12.346 Тара=0.100 т d=0.020", decoded.Text);
+        Assert.StartsWith("1474: 18:36:07.701 [Прибор 2] ", raw.Text);
+        Assert.Equal(decoded.IsError, raw.IsError);
+        Assert.False(raw.IsError);
+
+        var anchor = new JournalAnchor(2, r.ExchangeId);
+        var index = new JournalTextIndex();
+        index.Append(new JournalAnchor(1, Guid.NewGuid()), 10);
+        index.Append(anchor, raw.Text.Length + 1);
+        Assert.Equal(anchor, index.At(10)!.Anchor);
+        index.Clear();
+        index.Append(anchor, decoded.Text.Length + 1);
+        Assert.Equal(0, index.Find(anchor)!.Start);
+        Assert.Equal(anchor, index.Find(anchor)!.Anchor);
+
+        r.ErrorCode = 2;
+        Assert.True(TraceFormatter.FormatData(r, 2, rawValues: true).IsError);
+        r.IsConnected = false;
+        Assert.Equal(TraceFormatter.FormatData(r, 2), TraceFormatter.FormatData(r, 2, rawValues: true));
     }
 
     [Fact]
@@ -230,7 +304,7 @@ public class TraceFormatterTests
         Assert.Equal("21:50:02.412 [Система] Сессия журнала закрыта.", TraceFormatter.SessionClosed(T("21:50:02.412")));
         Assert.Equal("21:50:02.410 [Прибор 1] 10.0.1.18:502 | Опрос выключен оператором. Ответов 601, сбоев 0.",
             TraceFormatter.FormatEvent(T("21:50:02.410"), 1, "10.0.1.18:502", "Опрос выключен оператором. Ответов 601, сбоев 0."));
-        Assert.Equal("21:47:31.102 [Система] Обозначения: № — номер транзакции Modbus TCP (одинаков в запросе и ответе); Id — адрес устройства (Unit Identifier, 7-й байт, как адрес в RTU); FC — код функции (hex); адрес и регистров — dec (hex), адреса как в документе, без смещения −1; HEX: 6 байт TCP-префикса (№, протокол 0, длина) → Id + PDU (= кадр RTU без CRC); «период» — от предыдущего TX показаний этого прибора; «ответ через» — от отправки TX до последнего байта ответа; инициализация (1000, 1100…) идёт подряд без периода.",
+        Assert.Equal("21:47:31.102 [Система] " + TraceFormatter.Legend,
             TraceFormatter.LegendLine(T("21:47:31.102")));
     }
 
@@ -243,7 +317,7 @@ public class TraceFormatterTests
         if (lowWordFirst)
             for (int i = 2; i < 8; i += 2) (words[i], words[i + 1]) = (words[i + 1], words[i]);
         var result = TraceFormatter.FormatInitializationData(Initialization(TracePhase.Identification, words, lowWordFirst), 1)!.Value;
-        Assert.Equal("21:47:31.152 [Прибор 1] Идентификация №1 | Тип=100 (M10) | SN=53596 | FW=1.085 | DT_Current=1793561794 | DT_Boot=1793376672" +
+        Assert.Equal("1: 21:47:31.152 [Прибор 1] Идентификация | Тип=100 (M10) | SN=53596 | FW=1.085 | DT_Current=1793561794 | DT_Boot=1793376672" +
             $" | Endians={(lowWordFirst ? 1 : 0)} ({(lowWordFirst ? "младшее" : "старшее")} слово первым)", result.Text);
         Assert.False(result.IsError);
     }
@@ -256,10 +330,10 @@ public class TraceFormatterTests
     {
         var result = TraceFormatter.FormatInitializationData(
             Initialization(TracePhase.ScaleConfig, ConfigWords(lowWordFirst), lowWordFirst, scale), 2)!.Value;
-        Assert.Equal($"21:47:31.152 [Прибор 2] Конфигурация №2 · Весы {scale} | SN весов=45000 | Единица=1 (т)" +
+        Assert.Equal($"2: 21:47:31.152 [Прибор 2] Конфигурация · Весы {scale} | SN весов=45000 | Единица=1 (т)" +
             " | Тип диапазонов=2 (многодиапазонные) | Диапазонов=2" +
-            " | Диапазон 1: Min=0.399999976 Max=60 d=0.0199999996" +
-            " | Диапазон 2: Min=1 Max=80 d=0.0500000007", result.Text);
+            " | Диапазон 1: Min=0.400 Max=60.000 d=0.020" +
+            " | Диапазон 2: Min=1.000 Max=80.000 d=0.050", result.Text);
         Assert.DoesNotContain("Диапазон 3:", result.Text);
         Assert.False(result.IsError);
     }
@@ -282,6 +356,22 @@ public class TraceFormatterTests
         var count = TraceFormatter.FormatInitializationData(Initialization(TracePhase.ScaleConfig, words), 1)!.Value;
         Assert.True(count.IsError);
         Assert.DoesNotContain("Диапазон 1:", count.Text);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    [InlineData(65535)]
+    public void Identification_DoesNotRejectOtherFirmwareVersions(ushort major)
+    {
+        ushort[] words = { 100, 1, major, 85, 0, 0, 0, 0, 0 };
+        var decoded = TraceFormatter.FormatInitializationData(Initialization(TracePhase.Identification, words), 1)!.Value;
+        Assert.False(decoded.IsError);
+        Assert.Contains($"FW={major}.085", decoded.Text);
+        words[0] = 99;
+        decoded = TraceFormatter.FormatInitializationData(Initialization(TracePhase.Identification, words), 1)!.Value;
+        Assert.True(decoded.IsError);
+        Assert.Contains("ожидался M10 (100)", decoded.Text);
     }
 
     [Fact]

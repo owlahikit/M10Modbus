@@ -43,8 +43,9 @@ namespace M10Modbus
         public IReadOnlyList<ScaleRange> Ranges { get; set; } = Array.Empty<ScaleRange>();
         /// <summary>Whole PollAsync call, including (re)connection and initialization. Not shown in the UI.</summary>
         public double ElapsedMs { get; set; }
-        /// <summary>Transaction number of the current-weight read (0 if it was not sent).</summary>
+        /// <summary>Transaction number of the current-weight read; ExchangeId distinguishes an unsent request from wrapped number 0.</summary>
         public ushort TransactionId { get; set; }
+        public Guid ExchangeId { get; set; }
         /// <summary>TX → last byte of the current-weight response, ms.</summary>
         public double ResponseMs { get; set; }
         /// <summary>Stopwatch ticks right before the current-weight request was written; 0 if not sent.</summary>
@@ -60,6 +61,12 @@ namespace M10Modbus
         public string FormatWeight(float value, IFormatProvider? provider = null)
         {
             if (!float.IsFinite(value) || !float.IsFinite(Division) || Division <= 0) return "—";
+            return FormatNumber(value, provider);
+        }
+
+        public static string FormatNumber(float value, IFormatProvider? provider = null)
+        {
+            if (!float.IsFinite(value)) return value.ToString(CultureInfo.InvariantCulture);
             // Match the M10 screen: three decimal places.
             string roundTrip = value.ToString("R", CultureInfo.InvariantCulture);
             if (decimal.TryParse(roundTrip, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal exact))
@@ -100,6 +107,7 @@ namespace M10Modbus
         public string Endpoint { get; init; } = "";
         /// <summary>Transaction number of the request (for RX too).</summary>
         public ushort TransactionId { get; init; }
+        public Guid ExchangeId { get; init; }
         public byte UnitId { get; init; }
         public ushort StartAddress { get; init; }
         public ushort RegisterCount { get; init; }
@@ -154,6 +162,7 @@ namespace M10Modbus
         }
         public bool IsConnected => _stream != null && _tcpClient?.Connected == true;
         public event Action<ModbusTrace>? Trace;
+        public event Action<CardEvent>? Identified;
 
         public M10ModbusClient(string ipAddress, int port = 502, byte unitId = 1, int scaleNumber = 1)
         {
@@ -229,6 +238,7 @@ namespace M10Modbus
             catch (ConfigurationException ex)
             {
                 Disconnect();
+                result.Timestamp = DateTime.Now;
                 result.Failure = PollFailure.Configuration;
                 result.RequiresOperatorAction = true;
                 result.ConnectionError = ex.Message;
@@ -237,6 +247,7 @@ namespace M10Modbus
             catch (ModbusException ex)
             {
                 Disconnect();
+                result.Timestamp = DateTime.Now;
                 result.Failure = PollFailure.ModbusException;
                 result.RequiresOperatorAction = ex.Code is 1 or 2 or 3;
                 result.ConnectionError = $"{Endpoint}, весы {ScaleNumber}: {ex.Message}" +
@@ -251,6 +262,7 @@ namespace M10Modbus
             finally
             {
                 result.TransactionId = exchange.TransactionId;
+                result.ExchangeId = exchange.Id;
                 result.PollTxTicks = exchange.TxTicks;
                 if (exchange.RxTicks != 0) result.ResponseMs = TicksToMs(exchange.RxTicks - exchange.TxTicks);
                 result.ElapsedMs = timer.Elapsed.TotalMilliseconds; _gate.Release();
@@ -260,13 +272,14 @@ namespace M10Modbus
 
         private async Task InitializeAsync(CancellationToken ct)
         {
-            ushort[] info = await ReadHoldingRegistersAsync(1000, 9, TracePhase.Identification, PollSlot.Immediate, null, ct).ConfigureAwait(false);
+            var identification = new Exchange();
+            ushort[] info = await ReadHoldingRegistersAsync(1000, 9, TracePhase.Identification, PollSlot.Immediate, identification, ct).ConfigureAwait(false);
             if (info[0] != 100) throw ConfigError($"Регистр 1000: тип {info[0]}, ожидался M10 (100).");
+            Identified?.Invoke(new CardEvent(identification.RxTime, $"Обмен установлен; M10 SN {info[1]}.", Tone.Good)
+                { ExchangeId = identification.Id, TransactionId = identification.TransactionId });
             if (info[8] > 1) throw ConfigError($"Регистр Endians (1008): неизвестное значение {info[8]}.");
             _lowWordFirst = info[8] == 1;
             uint firmware = ReadUInt32(info, 2);
-            if ((firmware >> 16) != 1)
-                throw ConfigError($"Firmware {firmware >> 16}.{firmware & 0xFFFF:D3}: протокол рассчитан на 001.XXX.");
             ushort configAddress = (ushort)(1100 + 33 * (ScaleNumber - 1));
             ushort[] config = await ReadHoldingRegistersAsync(configAddress, 22, TracePhase.ScaleConfig, PollSlot.Immediate, null, ct).ConfigureAwait(false);
             if (Array.TrueForAll(config, word => word == 0))
@@ -315,6 +328,7 @@ namespace M10Modbus
 
         private sealed class Exchange
         {
+            public Guid Id;
             public ushort TransactionId;
             public long TxTicks;
             public long RxTicks;
@@ -327,6 +341,7 @@ namespace M10Modbus
             if (_stream == null) throw new IOException("TCP-соединение отсутствует.");
             var stream = _stream;
             ushort tid = unchecked(++_transactionId);
+            Guid exchangeId = Guid.NewGuid();
             byte[] request = { (byte)(tid >> 8), (byte)tid, 0, 0, 0, 6, UnitId, 3,
                 (byte)(start >> 8), (byte)start, (byte)(count >> 8), (byte)count };
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -343,12 +358,15 @@ namespace M10Modbus
                 DateTime txTime = DateTime.Now;
                 await stream.WriteAsync(request.AsMemory(), timeout.Token).ConfigureAwait(false);
                 sent = true;
+                if (exchange != null)
+                {
+                    exchange.Id = exchangeId; exchange.TransactionId = tid; exchange.TxTicks = txTicks;
+                }
                 double? periodMs = null;
                 if (phase == TracePhase.Poll)
                 {
                     if (_lastPollTxTicks != 0) periodMs = TicksToMs(txTicks - _lastPollTxTicks);
                     _lastPollTxTicks = txTicks;
-                    if (exchange != null) { exchange.TransactionId = tid; exchange.TxTicks = txTicks; }
                 }
                 Emit("TX", txTime, request, periodMs: periodMs,
                     plannedPeriodMs: phase == TracePhase.Poll ? slot.PlannedPeriodMs : 0, overrun: phase == TracePhase.Poll && slot.Overrun);
@@ -415,7 +433,7 @@ namespace M10Modbus
                 double? periodMs = null, double plannedPeriodMs = 0, bool overrun = false, int? expectedLength = null, string note = "")
             {
                 Trace?.Invoke(new ModbusTrace { Timestamp = time, Direction = direction, Endpoint = Endpoint,
-                    TransactionId = tid, UnitId = UnitId, StartAddress = start, RegisterCount = count,
+                    TransactionId = tid, ExchangeId = exchangeId, UnitId = UnitId, StartAddress = start, RegisterCount = count,
                     Bytes = bytes, IsComplete = complete, Phase = phase, ScaleNumber = ScaleNumber, LowWordFirst = _lowWordFirst,
                     ResponseMs = responseMs, PeriodMs = periodMs, PlannedPeriodMs = plannedPeriodMs,
                     Overrun = overrun, ExpectedLength = expectedLength, Note = note });

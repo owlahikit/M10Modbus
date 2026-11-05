@@ -39,8 +39,9 @@ namespace M10Modbus
 
         private const int MaxEntries = 5000;
         internal static readonly Color PanelGrey = Color.FromArgb(0xAC, 0xAC, 0xAC);
-        private static readonly Color TxColor = Color.FromArgb(25, 82, 150);
-        private static readonly Color RxColor = Color.FromArgb(25, 115, 78);
+        private static readonly Color TxColor = Color.FromArgb(80, 190, 110);
+        private static readonly Color RxColor = Color.FromArgb(145, 225, 165);
+        private static readonly Color DecodedColor = Color.LightSkyBlue;
 
         private readonly DeviceRunner[] _runners;
         private readonly NumericUpDown _period = new NumericUpDown { Minimum = 100, Maximum = 10000, Increment = 50, Value = 250, Width = 80 };
@@ -50,7 +51,7 @@ namespace M10Modbus
         private readonly SplitContainer _split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal,
             FixedPanel = FixedPanel.Panel1, Margin = Padding.Empty };
         private readonly RichTextBox _log = new RichTextBox { Dock = DockStyle.Fill, ReadOnly = true,
-            WordWrap = false, DetectUrls = false, BackColor = Color.FromArgb(20, 20, 20),
+            WordWrap = false, DetectUrls = false, HideSelection = false, BackColor = Color.FromArgb(20, 20, 20),
             ForeColor = Color.Gainsboro, Font = new Font("Consolas", 9F), BorderStyle = BorderStyle.None };
         private readonly ComboBox _view = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
         private readonly ComboBox _deviceFilter = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 130 };
@@ -58,7 +59,11 @@ namespace M10Modbus
         private readonly ToolStripStatusLabel _status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
         private readonly ToolTip _tips = new ToolTip();
         private readonly Queue<LogEntry> _entries = new Queue<LogEntry>();
-        private readonly Queue<LogEntry> _deferredLogEntries = new Queue<LogEntry>();
+        private readonly JournalTextView _logView;
+        private JournalAnchor? _selectedEntry;
+        private bool _selectTransaction;
+        private long _nextEntryId;
+        private readonly JournalSequence _sequence = new();
         private readonly string _dataRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "M10MbTcp");
         private string SettingsFile => Path.Combine(_dataRoot, "settings.json");
         private SessionJournal? _journal;
@@ -73,16 +78,14 @@ namespace M10Modbus
         private bool _suppressToggle;
         private bool _closing;
         private bool _allowClose;
-        private bool _selectingLog;
-        private bool _deferredLogOverflow;
         private int _periodMs = 250;
         private int _timeoutMs = 1500;
-        private sealed record LogEntry(int Device, LogKind Kind, string Text, Color Color);
+        private sealed record LogEntry(int Device, LogKind Kind, string Text, Color Color, JournalAnchor Anchor, string? RawText);
 
         public MainForm()
         {
             SuspendLayout();
-            Text = "M10 · Монитор Modbus TCP v4.5";
+            Text = "M10 · Монитор Modbus TCP v4.8";
             Font = new Font("Segoe UI", 9F);
             AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
@@ -90,6 +93,14 @@ namespace M10Modbus
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = PanelGrey;
             _runners = new[] { new DeviceRunner(new ScalePanel(1, "10.0.1.18")), new DeviceRunner(new ScalePanel(2, "10.0.1.8")) };
+            _logView = new JournalTextView(_log, () => _scroll.Checked, 400000, MaxEntries);
+            _logView.RecordSelected += anchor =>
+            {
+                _selectedEntry = anchor;
+                _selectTransaction = false;
+                _scroll.Checked = false;
+            };
+            _logView.CopyRequested += CopyLog;
             _stopAll = MakeButton("Остановить всё", async (_, _) => await StopAllAsync());
             BuildLayout();
             bool settingsRead = LoadSettings();
@@ -98,6 +109,7 @@ namespace M10Modbus
                 DeviceRunner r = runner;
                 r.Panel.PollToggled += (_, _) => OnPollToggled(r);
                 r.Panel.ResetRequested += (_, _) => ApplyEvents(r, r.Model.ResetLatch(DateTime.Now));
+                r.Panel.EventSelected += SelectCardEvent;
                 r.Panel.Render(r.Model.View);
             }
             _period.ValueChanged += (_, _) => Volatile.Write(ref _periodMs, (int)_period.Value);
@@ -153,13 +165,14 @@ namespace M10Modbus
             var title = new Label { Text = "Журнал обмена", AutoSize = true, Margin = new Padding(3, 8, 6, 0) };
             title.Font = new Font(Font, FontStyle.Bold);
             _view.Items.AddRange(new object[] { "Все записи", "HEX: TX / RX", "Расшифровка", "События", "Показания", "Инициализация" }); _view.SelectedIndex = 0;
-            _tips.SetToolTip(_view, "Расшифровка — показания и настройки; Показания — только числовые ответы весов; " +
+            _tips.SetToolTip(_view, "Расшифровка — показания и настройки с тремя дробными знаками; " +
+                "Показания — исходные числовые ответы весов без округления до трёх знаков; " +
                 "Инициализация — запросы, ответы HEX и расшифровка идентификации/конфигурации.");
             _deviceFilter.Items.AddRange(new object[] { "Оба прибора", "Прибор 1", "Прибор 2" }); _deviceFilter.SelectedIndex = 0;
             _view.SelectedIndexChanged += (_, _) => RenderLog(); _deviceFilter.SelectedIndexChanged += (_, _) => RenderLog();
             var clear = MakeButton("Clear · Очистить", (_, _) =>
             {
-                _entries.Clear(); _deferredLogEntries.Clear(); _deferredLogOverflow = false; _log.Clear();
+                _entries.Clear(); _logView.Clear(); _selectedEntry = null; _selectTransaction = false;
                 foreach (DeviceRunner r in _runners) r.Panel.ClearHistory();
             });
             var copy = MakeButton("Копировать", (_, _) => CopyLog());
@@ -170,21 +183,11 @@ namespace M10Modbus
             _tips.SetToolTip(save, "Экспортировать текущее содержимое экрана. Полные журналы сессий находятся в папке журналов.");
             _scroll.CheckedChanged += (_, _) =>
             {
+                foreach (DeviceRunner r in _runners) r.Panel.AutoScroll = _scroll.Checked;
                 if (_scroll.Checked) NativeLogScroll.ToBottom(_log);
             };
-            _log.MouseDown += (_, e) =>
-            {
-                if (e.Button == MouseButtons.Left) _selectingLog = true;
-            };
-            _log.MouseUp += (_, e) =>
-            {
-                if (e.Button == MouseButtons.Left) FinishLogSelection();
-            };
-            _log.MouseCaptureChanged += (_, _) =>
-            {
-                if (!_log.Capture) FinishLogSelection();
-            };
-            _tips.SetToolTip(_scroll, "Выключите, чтобы читать предыдущие записи. Опрос и запись в файлы продолжаются.");
+            _tips.SetToolTip(_scroll, "Автопрокрутка журнала и белых полей событий обеих карточек. " +
+                "Выбор записи выключает прокрутку; опрос и запись в файлы продолжаются.");
             foreach (Control control in new Control[] { title, _view, _deviceFilter, clear, copy, save, folder, _scroll })
                 logTools.Controls.Add(Group(control));
             journal.Controls.Add(logTools, 0, 0); journal.Controls.Add(_log, 0, 1);
@@ -472,7 +475,14 @@ namespace M10Modbus
         {
             int device = runner.Number;
             using var client = new M10ModbusClient(s.Ip.Trim(), s.Port, (byte)s.UnitId, s.Scale);
-            client.Trace += trace => Post(() => AddTrace(device, trace));
+            client.Trace += trace => Post(() =>
+            {
+                if (generation == runner.Generation) AddTrace(device, trace);
+            });
+            client.Identified += identified => Post(() =>
+            {
+                if (generation == runner.Generation) ApplyEvents(runner, runner.Model.ApplyIdentification(identified));
+            });
             var scheduler = new PollScheduler(Stopwatch.GetTimestamp, Stopwatch.Frequency, Task.Delay);
             int failures = 0;
             try
@@ -510,8 +520,9 @@ namespace M10Modbus
             DeviceRunner r = _runners[device - 1];
             if (generation != r.Generation || r.Model.Phase == CardPhase.Off) return;
             (string text, bool isError) = TraceFormatter.FormatData(result, device);
-            AddLog(device, result.TransactionId == 0 ? LogKind.Initialization : LogKind.Readings,
-                text, isError ? Color.Firebrick : Color.DimGray);
+            AddLog(device, result.ExchangeId == Guid.Empty ? LogKind.Initialization : LogKind.Readings,
+                text, isError ? Color.Firebrick : DecodedColor, result.ExchangeId,
+                TraceFormatter.FormatData(result, device, rawValues: true).Text);
             ApplyEvents(r, r.Model.Apply(result));
         }
 
@@ -520,8 +531,10 @@ namespace M10Modbus
         {
             foreach (CardEvent e in events)
             {
-                r.Panel.AddEvent(e);
-                AddLog(r.Number, LogKind.Event, TraceFormatter.FormatEvent(e.Time, r.Number, r.Model.Endpoint, e.Text), ToneColor(e.Tone));
+                JournalAnchor anchor = AddLog(r.Number, LogKind.Event,
+                    (e.ExchangeId != Guid.Empty ? $"{e.TransactionId}: " : "") +
+                    TraceFormatter.FormatEvent(e.Time, r.Number, r.Model.Endpoint, e.Text), ToneColor(e.Tone), e.ExchangeId);
+                r.Panel.AddEvent(e, anchor);
             }
             r.Panel.Render(r.Model.View);
         }
@@ -536,9 +549,9 @@ namespace M10Modbus
                 TraceTone.Warning => Color.DarkOrange,
                 _ => Color.Firebrick
             };
-            AddLog(device, trace.Phase == TracePhase.Poll ? LogKind.Hex : LogKind.InitializationHex, text, color);
+            AddLog(device, trace.Phase == TracePhase.Poll ? LogKind.Hex : LogKind.InitializationHex, text, color, trace.ExchangeId);
             if (TraceFormatter.FormatInitializationData(trace, device) is { } decoded)
-                AddLog(device, LogKind.Initialization, decoded.Text, decoded.IsError ? Color.Firebrick : Color.DimGray);
+                AddLog(device, LogKind.Initialization, decoded.Text, decoded.IsError ? Color.Firebrick : DecodedColor, trace.ExchangeId);
         }
 
         internal static Color ToneColor(Tone tone) => tone switch
@@ -574,8 +587,8 @@ namespace M10Modbus
         {
             if (_journal != null) return;
             DateTime now = DateTime.Now;
-            string directory = Path.Combine(_dataRoot, "logs", now.ToString("yyyy-MM-dd_HH-mm-ss-fff", CultureInfo.InvariantCulture) + "_" + Guid.NewGuid().ToString("N").Substring(0, 6));
-            try { Directory.CreateDirectory(directory); }
+            string directory;
+            try { directory = SessionJournal.CreateSessionDirectory(Path.Combine(_dataRoot, "logs"), now); }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
             {
                 _journalProblem = ex.Message;
@@ -620,124 +633,67 @@ namespace M10Modbus
 
         // ───────────── Journal view ─────────────
 
-        private void AddLog(int device, LogKind kind, string text, Color color)
+        private JournalAnchor AddLog(int device, LogKind kind, string text, Color color, Guid exchangeId = default, string? rawText = null)
         {
-            var entry = new LogEntry(device, kind, text, color);
+            JournalGroup group = _sequence.Get(exchangeId);
+            if (group.Number is { } number)
+            {
+                text = TraceFormatter.WithJournalNumber(text, number);
+                if (rawText != null) rawText = TraceFormatter.WithJournalNumber(rawText, number);
+            }
+            var anchor = new JournalAnchor(++_nextEntryId, exchangeId) { BlockOrder = group.Order };
+            var entry = new LogEntry(device, kind, text, color, anchor, rawText);
             _journal?.Write("traffic.txt", text);
             if (device > 0 && kind == LogKind.Event) _journal?.Write($"info_device{device}.txt", text);
             _entries.Enqueue(entry);
             while (_entries.Count > MaxEntries) _entries.Dequeue();
-            if (!Matches(entry)) return;
-            if ((_selectingLog && !_scroll.Checked) || _deferredLogEntries.Count > 0 || _deferredLogOverflow)
-            {
-                if (!_deferredLogOverflow)
-                {
-                    if (_deferredLogEntries.Count < MaxEntries) _deferredLogEntries.Enqueue(entry);
-                    else { _deferredLogEntries.Clear(); _deferredLogOverflow = true; }
-                }
-                return;
-            }
-            AppendEntries(new[] { entry });
+            if (Matches(entry)) _logView.Append(anchor, VisibleText(entry), LogInk(color));
+            return anchor;
         }
 
         private static Color LogInk(Color color) => color == Color.Firebrick ? Color.Salmon
             : color == Color.DarkOrange ? Color.Orange
             : color == Color.SlateGray || color == Color.DimGray ? Color.Gainsboro
+            : color == TxColor || color == RxColor || color == DecodedColor ? color
             : Color.FromArgb(Math.Max(110, (int)color.R), Math.Max(150, (int)color.G), Math.Max(110, (int)color.B));
 
         private bool Matches(LogEntry entry) => (_deviceFilter.SelectedIndex == 0 || entry.Device == _deviceFilter.SelectedIndex || entry.Device == 0) &&
             LogViewFilter.Includes((LogView)_view.SelectedIndex, entry.Kind);
 
-        private void FinishLogSelection()
-        {
-            if (!_selectingLog) return;
-            _selectingLog = false;
-            if (IsDisposed || Disposing || !IsHandleCreated) return;
-            BeginInvoke((Action)(() =>
-            {
-                if (_selectingLog || IsDisposed || Disposing) return;
-                if (_deferredLogOverflow)
-                {
-                    RenderLog();
-                    _status.Text = "Журнал обновлён: показаны последние записи; проверьте полный журнал в файле.";
-                }
-                else if (_deferredLogEntries.Count > 0)
-                {
-                    AppendEntries(_deferredLogEntries);
-                    _deferredLogEntries.Clear();
-                }
-            }));
-        }
+        private string VisibleText(LogEntry entry) => (LogView)_view.SelectedIndex == LogView.Readings
+            ? entry.RawText ?? entry.Text : entry.Text;
 
-        private void AppendEntries(IEnumerable<LogEntry> entries)
+        private void SelectCardEvent(JournalAnchor anchor)
         {
-            bool preserveView = !_scroll.Checked;
-            bool suppressRedraw = preserveView && _log.Visible;
-            int firstLine = (int)SendMessage(_log.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
-            int selection = _log.SelectionStart, length = _log.SelectionLength;
-            var scrollPosition = Point.Empty;
-            if (preserveView)
+            _selectedEntry = anchor;
+            _selectTransaction = true;
+            _scroll.Checked = false;
+            _view.SelectedIndex = (int)LogView.All;
+            _deviceFilter.SelectedIndex = 0;
+            RenderLog();
+            if (!_logView.Select(anchor, exact: true, transaction: true))
             {
-                SendMessage(_log.Handle, 0x04DD, IntPtr.Zero, ref scrollPosition); // EM_GETSCROLLPOS
-                if (suppressRedraw) SendMessage(_log.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero); // WM_SETREDRAW
-            }
-            try
-            {
-                foreach (LogEntry entry in entries)
-                {
-                    _log.Select(_log.TextLength, 0); _log.SelectionColor = LogInk(entry.Color);
-                    _log.AppendText(entry.Text + Environment.NewLine);
-                    if (_log.TextLength <= 400000) continue;
-                    string visible = _log.Text;
-                    int lineEnd = visible.IndexOf('\n', 100000);
-                    int cut = lineEnd >= 0 ? lineEnd + 1 : 100000;
-                    int removedLines = visible.Take(cut).Count(c => c == '\n');
-                    LogTextBox.RemovePrefix(_log, cut);
-                    selection = Math.Max(0, selection - cut);
-                    length = Math.Min(length, _log.TextLength - selection);
-                    firstLine = Math.Max(0, firstLine - removedLines);
-                }
-                if (!preserveView) NativeLogScroll.ToBottom(_log);
-                else
-                {
-                    _log.Select(selection, length);
-                    SendMessage(_log.Handle, 0x04DE, IntPtr.Zero, ref scrollPosition); // EM_SETSCROLLPOS
-                    int now = (int)SendMessage(_log.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
-                    SendMessage(_log.Handle, 0x00B6, IntPtr.Zero, (IntPtr)(firstLine - now));
-                }
-            }
-            finally
-            {
-                if (suppressRedraw)
-                {
-                    SendMessage(_log.Handle, 0x000B, (IntPtr)1, IntPtr.Zero);
-                    _log.Invalidate();
-                }
+                _logView.ClearTransaction();
+                _log.Select(0, 0);
+                _status.Text = "Событие уже удалено из экранного буфера; ищите его в файлах сессии, если запись журнала велась.";
             }
         }
-
-        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
-        private static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam);
-
-        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
-        private static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wparam, ref Point lparam);
 
         private void RenderLog()
         {
-            _deferredLogEntries.Clear();
-            _deferredLogOverflow = false;
-            _log.Clear();
-            // Add one block per entry to keep packet pairs readable.
-            foreach (var entry in _entries.Where(Matches))
-            {
-                _log.Select(_log.TextLength, 0); _log.SelectionColor = LogInk(entry.Color); _log.AppendText(entry.Text + Environment.NewLine);
-            }
+            _logView.Replace(_entries.Where(Matches).OrderBy(entry => entry.Anchor.BlockOrder)
+                .ThenBy(entry => entry.Anchor.EntryId).Select(entry => (entry.Anchor, VisibleText(entry), LogInk(entry.Color))));
+            if (_selectedEntry is { } anchor && _logView.Select(anchor, transaction: _selectTransaction)) return;
             if (_scroll.Checked) NativeLogScroll.ToBottom(_log);
         }
 
         private void CopyLog()
         {
-            try { string text = _log.SelectionLength > 0 ? _log.SelectedText : _log.Text; if (text.Length > 0) Clipboard.SetText(text); }
+            try
+            {
+                string text = _logView.TransactionText ?? (_log.SelectionLength > 0 ? _log.SelectedText : _log.Text);
+                if (text.Length > 0) Clipboard.SetText(text);
+            }
             catch (System.Runtime.InteropServices.ExternalException) { _status.Text = "Буфер обмена занят. Повторите копирование."; }
         }
 
@@ -923,7 +879,9 @@ namespace M10Modbus
         private readonly Label _state = Caption();
         private readonly Button _reset;
         private readonly RichTextBox _history = new RichTextBox { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.FixedSingle,
-            BackColor = Color.FromArgb(250, 250, 245), DetectUrls = false, Font = new Font("Segoe UI", 9F), MinimumSize = Size.Empty };
+            BackColor = Color.FromArgb(250, 250, 245), DetectUrls = false, HideSelection = false, Font = new Font("Segoe UI", 9F), MinimumSize = Size.Empty };
+        private readonly JournalTextView _historyView;
+        private bool _autoScroll = true;
         private readonly TableLayoutPanel _layout;
         private readonly TableLayoutPanel _stateRow;
         private readonly Font _weightFont = new Font("Segoe UI", 32F, FontStyle.Regular);
@@ -935,6 +893,12 @@ namespace M10Modbus
 
         public event EventHandler? PollToggled;
         public event EventHandler? ResetRequested;
+        public event Action<JournalAnchor>? EventSelected;
+        public bool AutoScroll
+        {
+            get => _autoScroll;
+            set { _autoScroll = value; if (value) NativeLogScroll.ToBottom(_history); }
+        }
 
         public int DeviceNumber { get; }
         public string IpAddress => _ip.Text.Trim();
@@ -950,6 +914,8 @@ namespace M10Modbus
         public ScalePanel(int number, string ip)
         {
             DeviceNumber = number;
+            _historyView = new JournalTextView(_history, () => AutoScroll, 20000, 5000);
+            _historyView.RecordSelected += anchor => EventSelected?.Invoke(anchor);
             MainForm.StyleToggleButton(_poll);
             Text = "Прибор " + number;
             Dock = DockStyle.Fill;
@@ -1253,20 +1219,13 @@ namespace M10Modbus
             Margin = new Padding(0, 1, 0, 1)
         };
 
-        public void AddEvent(CardEvent e)
+        public void AddEvent(CardEvent e, JournalAnchor anchor)
         {
-            AppendHistory(e);
+            _historyView.Append(anchor, e.Time.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + e.Text,
+                MainForm.ToneColor(e.Tone));
         }
 
-        private void AppendHistory(CardEvent e)
-        {
-            if (_history.TextLength > 20000) LogTextBox.RemovePrefix(_history, 5000);
-            _history.Select(_history.TextLength, 0); _history.SelectionColor = MainForm.ToneColor(e.Tone);
-            _history.AppendText(e.Time.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + e.Text + Environment.NewLine);
-            NativeLogScroll.ToBottom(_history);
-        }
-
-        public void ClearHistory() => _history.Clear();
+        public void ClearHistory() => _historyView.Clear();
 
         public DeviceSettings GetSettings() => new DeviceSettings { Ip = IpAddress, Port = Port, UnitId = UnitId, Scale = ScaleNumber,
             Digits = null };
@@ -1289,8 +1248,218 @@ namespace M10Modbus
         }
     }
 
+    internal sealed class JournalTextView
+    {
+        private readonly RichTextBox _box;
+        private readonly Func<bool> _autoScroll;
+        private readonly int _maxCharacters, _maxEntries;
+        private readonly JournalTextIndex _index = new();
+        private readonly Queue<(JournalAnchor Anchor, string Text, Color Color)> _pending = new();
+        private bool _pressed, _dragged;
+        private Point _mouseDown;
+        private int _clicks;
+        private JournalAnchor? _transaction;
+        private static readonly Color TransactionBackColor = Color.FromArgb(48, 72, 96);
+
+        public event Action<JournalAnchor>? RecordSelected;
+        public event Action? CopyRequested;
+        public string? TransactionText
+        {
+            get
+            {
+                if (_transaction is not { } anchor) return null;
+                string text = _box.Text;
+                return string.Concat(_index.TransactionRanges(anchor).Select(range => text.Substring(range.Start, range.Length)));
+            }
+        }
+
+        public JournalTextView(RichTextBox box, Func<bool> autoScroll, int maxCharacters, int maxEntries)
+        {
+            _box = box; _autoScroll = autoScroll; _maxCharacters = maxCharacters; _maxEntries = maxEntries;
+            box.MouseDown += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left) return;
+                ClearTransaction();
+                _pressed = true; _dragged = false; _mouseDown = e.Location; _clicks = e.Clicks;
+            };
+            box.MouseMove += (_, e) =>
+            {
+                if (_pressed && (Math.Abs(e.X - _mouseDown.X) >= SystemInformation.DragSize.Width / 2 ||
+                    Math.Abs(e.Y - _mouseDown.Y) >= SystemInformation.DragSize.Height / 2)) _dragged = true;
+            };
+            box.MouseUp += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left || !_pressed) return;
+                _pressed = false;
+                if (!_dragged && _clicks == 1 && _index.At(box.GetCharIndexFromPosition(e.Location)) is { } row)
+                    SelectEntry(row);
+                NotifySelection();
+                FlushPending();
+            };
+            box.MouseCaptureChanged += (_, _) =>
+            {
+                if (!box.IsHandleCreated || box.IsDisposed) return;
+                box.BeginInvoke((Action)(() =>
+                {
+                    if (box.IsDisposed || box.Capture || !_pressed) return;
+                    _pressed = false;
+                    NotifySelection();
+                    FlushPending();
+                }));
+            };
+            box.KeyUp += (_, e) =>
+            {
+                if (e.KeyCode is Keys.Up or Keys.Down or Keys.Left or Keys.Right or Keys.Home or Keys.End or Keys.PageUp or Keys.PageDown)
+                    NotifySelection();
+            };
+            box.KeyDown += (_, e) =>
+            {
+                if (e.Control && e.KeyCode == Keys.C && _transaction != null)
+                {
+                    CopyRequested?.Invoke(); e.SuppressKeyPress = true;
+                }
+                else if ((e.Control && e.KeyCode == Keys.A) ||
+                    e.KeyCode is Keys.Up or Keys.Down or Keys.Left or Keys.Right or Keys.Home or Keys.End or Keys.PageUp or Keys.PageDown)
+                    ClearTransaction();
+            };
+        }
+
+        private void NotifySelection()
+        {
+            if (_index.At(_box.SelectionStart) is { } row) RecordSelected?.Invoke(row.Anchor);
+        }
+
+        private void SelectEntry(JournalTextRange row)
+        {
+            string text = _box.Text;
+            int end = row.Start + row.Length;
+            while (end > row.Start && text[end - 1] is '\r' or '\n') end--;
+            _box.Select(row.Start, end - row.Start);
+        }
+
+        public void ClearTransaction()
+        {
+            if (_transaction == null) return;
+            _transaction = null;
+            var viewport = NativeLogScroll.Capture(_box);
+            int start = _box.SelectionStart, length = _box.SelectionLength;
+            _box.SelectAll(); _box.SelectionBackColor = _box.BackColor;
+            _box.Select(start, length);
+            NativeLogScroll.Restore(_box, viewport);
+        }
+
+        private void HighlightTransaction(JournalAnchor anchor)
+        {
+            foreach (var range in _index.TransactionRanges(anchor))
+            {
+                _box.Select(range.Start, range.Length);
+                _box.SelectionBackColor = TransactionBackColor;
+            }
+        }
+
+        public bool Select(JournalAnchor anchor, bool exact = false, bool transaction = false)
+        {
+            if (_index.Find(anchor) is not { } row) return false;
+            if (exact && row.Anchor.EntryId != anchor.EntryId) return false;
+            ClearTransaction();
+            if (transaction)
+            {
+                _transaction = anchor;
+                HighlightTransaction(anchor);
+                var ranges = _index.TransactionRanges(anchor);
+                if (ranges.Count == 1) _box.Select(ranges[0].Start, ranges[0].Length);
+                else _box.Select(row.Start, 0);
+            }
+            else SelectEntry(row);
+            _box.ScrollToCaret();
+            var viewport = NativeLogScroll.Capture(_box);
+            NativeLogScroll.Restore(_box, viewport with { Position = new Point(0, viewport.Position.Y) });
+            return true;
+        }
+
+        public void Clear()
+        {
+            _pressed = false; _pending.Clear(); _index.Clear(); _transaction = null; _box.Clear();
+        }
+
+        public void Replace(IEnumerable<(JournalAnchor Anchor, string Text, Color Color)> entries)
+        {
+            Clear();
+            AppendEntries(entries);
+        }
+
+        public void Append(JournalAnchor anchor, string text, Color color)
+        {
+            if (_pressed)
+            {
+                _pending.Enqueue((anchor, text, color));
+                while (_pending.Count > _maxEntries) _pending.Dequeue();
+                return;
+            }
+            AppendEntries(new[] { (anchor, text, color) });
+        }
+
+        private void FlushPending()
+        {
+            if (_pending.Count == 0) return;
+            AppendEntries(_pending);
+            _pending.Clear();
+        }
+
+        private void AppendEntries(IEnumerable<(JournalAnchor Anchor, string Text, Color Color)> entries)
+        {
+            bool follow = _autoScroll();
+            var viewport = NativeLogScroll.Capture(_box);
+            int selection = _box.SelectionStart, length = _box.SelectionLength;
+            bool suppressRedraw = _box.IsHandleCreated && _box.Visible;
+            if (suppressRedraw) NativeLogScroll.SetRedraw(_box, false);
+            try
+            {
+                foreach (var entry in entries)
+                {
+                    int start = _index.InsertionPosition(entry.Anchor);
+                    int oldLength = _box.TextLength;
+                    int firstVisibleCharacter = _box.GetFirstCharIndexFromLine(viewport.FirstLine);
+                    _box.Select(start, 0); _box.SelectionColor = entry.Color;
+                    _box.SelectionBackColor = _transaction is { } anchor &&
+                        (anchor.ExchangeId == Guid.Empty ? anchor.EntryId == entry.Anchor.EntryId :
+                            anchor.ExchangeId == entry.Anchor.ExchangeId) ? TransactionBackColor : _box.BackColor;
+                    string text = entry.Text + Environment.NewLine;
+                    if (start == oldLength) _box.AppendText(text);
+                    else LogTextBox.Insert(_box, text);
+                    int added = _box.TextLength - oldLength;
+                    _index.Insert(entry.Anchor, start, added);
+                    if (start <= selection) selection += added;
+                    else if (start < selection + length) length += added;
+                    if (start < oldLength && start <= firstVisibleCharacter)
+                        viewport = viewport with { FirstLine = viewport.FirstLine + text.Count(c => c == '\n') };
+                }
+                int cut = _index.Trim(_maxCharacters, _maxEntries);
+                if (cut > 0)
+                {
+                    int removedLines = _box.Text.Take(cut).Count(c => c == '\n');
+                    LogTextBox.RemovePrefix(_box, cut);
+                    int end = Math.Max(0, selection + length - cut);
+                    selection = Math.Max(0, selection - cut); length = end - selection;
+                    viewport = viewport with { FirstLine = Math.Max(0, viewport.FirstLine - removedLines) };
+                }
+                _box.Select(selection, length);
+                if (follow) NativeLogScroll.ToBottom(_box);
+                else NativeLogScroll.Restore(_box, viewport);
+            }
+            finally { if (suppressRedraw) NativeLogScroll.SetRedraw(_box, true); }
+        }
+    }
+
     internal static class LogTextBox
     {
+        public static void Insert(RichTextBox box, string text)
+        {
+            bool readOnly = box.ReadOnly;
+            try { box.ReadOnly = false; box.SelectedText = text; }
+            finally { box.ReadOnly = readOnly; }
+        }
+
         public static void RemovePrefix(RichTextBox box, int length)
         {
             bool readOnly = box.ReadOnly;
@@ -1309,8 +1478,37 @@ namespace M10Modbus
 
     internal static class NativeLogScroll
     {
+        public readonly record struct Viewport(Point Position, int FirstLine);
+
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wparam, IntPtr lparam);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wparam, ref Point lparam);
+
+        public static Viewport Capture(RichTextBox box)
+        {
+            if (!box.IsHandleCreated) return new Viewport(Point.Empty, 0);
+            var position = Point.Empty;
+            SendMessage(box.Handle, 0x04DD, IntPtr.Zero, ref position); // EM_GETSCROLLPOS
+            return new Viewport(position, (int)SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero));
+        }
+
+        public static void Restore(RichTextBox box, Viewport viewport)
+        {
+            if (!box.IsHandleCreated) return;
+            Point position = viewport.Position;
+            SendMessage(box.Handle, 0x04DE, IntPtr.Zero, ref position); // EM_SETSCROLLPOS
+            int firstLine = (int)SendMessage(box.Handle, 0x00CE, IntPtr.Zero, IntPtr.Zero);
+            SendMessage(box.Handle, 0x00B6, IntPtr.Zero, (IntPtr)(viewport.FirstLine - firstLine)); // EM_LINESCROLL
+        }
+
+        public static void SetRedraw(RichTextBox box, bool enabled)
+        {
+            if (!box.IsHandleCreated) return;
+            SendMessage(box.Handle, 0x000B, enabled ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+            if (enabled) box.Invalidate();
+        }
 
         public static void ToBottom(RichTextBox box)
         {
