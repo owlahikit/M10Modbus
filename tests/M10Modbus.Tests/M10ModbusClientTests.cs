@@ -25,8 +25,14 @@ public class M10ModbusClientTests
         Task server = ServeAsync();
         using var client = new M10ModbusClient("127.0.0.1", port, scaleNumber: scale);
         var configTraces = new List<ModbusTrace>();
+        var traces = new List<ModbusTrace>();
+        var timeline = new List<string>();
+        var identifications = new List<CardEvent>();
+        client.Identified += e => { identifications.Add(e); timeline.Add("identified"); };
         client.Trace += trace =>
         {
+            traces.Add(trace);
+            timeline.Add($"{trace.Direction}:{trace.StartAddress}");
             if (trace.Phase == TracePhase.ScaleConfig && trace.Direction == "RX") configTraces.Add(trace);
         };
         M10PollResult first = await client.PollAsync(PollSlot.Immediate, deadline.Token);
@@ -38,6 +44,18 @@ public class M10ModbusClientTests
         Assert.True(first.IsConnected, first.ConnectionError);
         Assert.True(second.IsConnected, second.ConnectionError);
         Assert.True(restored.IsConnected, restored.ConnectionError);
+        Assert.Equal(new[] { "TX:1000", "RX:1000", "identified", $"TX:{1100 + 33 * (scale - 1)}" }, timeline.Take(4));
+        Assert.Equal(2, identifications.Count);
+        Assert.Equal(traces[1].Timestamp, identifications[0].Time);
+        Assert.Equal(traces[1].ExchangeId, identifications[0].ExchangeId);
+        Assert.NotEqual(first.ExchangeId, second.ExchangeId);
+        Assert.NotEqual(first.ExchangeId, restored.ExchangeId);
+        Assert.All(traces.GroupBy(t => t.ExchangeId), exchange =>
+        {
+            Assert.NotEqual(Guid.Empty, exchange.Key);
+            Assert.Equal(new[] { "TX", "RX" }, exchange.Select(t => t.Direction));
+        });
+        Assert.Contains(traces, t => t.Direction == "RX" && t.Phase == TracePhase.Poll && t.ExchangeId == first.ExchangeId);
         Assert.Equal(10f, first.Brutto);
         Assert.Equal(10f, second.Brutto);
         Assert.Equal("10.000", first.FormatWeight(first.Brutto, CultureInfo.InvariantCulture));
@@ -121,6 +139,36 @@ public class M10ModbusClientTests
 
 public class M10PollingRegressionTests
 {
+    [Theory]
+    [InlineData(100, 0, true)]
+    [InlineData(100, 2, true)]
+    [InlineData(100, 65535, true)]
+    [InlineData(99, 1, false)]
+    [InlineData(0, 1, false)]
+    public async Task Identification_ChecksM10Type_NotFirmware(ushort type, ushort firmwareMajor, bool accepted)
+    {
+        await using var server = new MockM10((address, count) =>
+        {
+            var words = Words(address, count);
+            if (address == 1000) { words[0] = type; words[2] = firmwareMajor; }
+            return words;
+        });
+        using var client = new M10ModbusClient("127.0.0.1", server.Port);
+        var identified = new List<CardEvent>();
+        client.Identified += identified.Add;
+        var result = await client.PollAsync();
+        Assert.Equal(accepted, result.IsConnected);
+        Assert.Equal(accepted ? 1 : 0, identified.Count);
+        if (!accepted)
+        {
+            Assert.True(result.RequiresOperatorAction);
+            Assert.Contains("ожидался M10 (100)", result.ConnectionError);
+            Assert.Equal(new ushort[] { 1000 }, server.Addresses.ToArray());
+            await client.PollAsync();
+            Assert.Equal(1, server.Connections);
+        }
+    }
+
     [Fact]
     public async Task ZeroScaleTwoConfiguration_PausesWithoutReconnect_WhileOtherDevicePolls()
     {
@@ -129,6 +177,8 @@ public class M10PollingRegressionTests
         using var badClient = new M10ModbusClient("127.0.0.1", missing.Port, scaleNumber: 2);
         using var goodClient = new M10ModbusClient("127.0.0.1", healthy.Port);
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var identified = new List<CardEvent>();
+        badClient.Identified += identified.Add;
 
         M10PollResult bad = await badClient.PollAsync(deadline.Token);
         for (int i = 0; i < 10; i++)
@@ -141,6 +191,8 @@ public class M10PollingRegressionTests
         M10PollResult goodAgain = await goodClient.PollAsync(deadline.Token);
 
         Assert.False(bad.IsConnected);
+        Assert.Single(identified); // The first valid response establishes exchange even if configuration fails next.
+        Assert.True(bad.Timestamp >= identified[0].Time);
         Assert.Contains($"127.0.0.1:{missing.Port}", bad.ConnectionError);
         Assert.Contains("весы 2", bad.ConnectionError);
         Assert.Contains("1133–1154", bad.ConnectionError);

@@ -39,7 +39,11 @@ namespace M10Modbus
     }
 
     /// <summary>Card history line and EVENT journal line. Time is the moment of the event, not of rendering.</summary>
-    public sealed record CardEvent(DateTime Time, string Text, Tone Tone);
+    public sealed record CardEvent(DateTime Time, string Text, Tone Tone)
+    {
+        public Guid ExchangeId { get; init; }
+        public ushort TransactionId { get; init; }
+    }
 
     /// <summary>State of one device card: error latching (D2), last-data snapshot («odometer») and connection phases.
     /// Not thread-safe: called on the UI thread only.</summary>
@@ -59,7 +63,6 @@ namespace M10Modbus
         private long _ok, _errors;
         private ushort _heldMask;
         private string _lastEventKey = "";
-        private DateTime? _lastSuccess;
         private bool _overrun;
         private DateTime _responseTime;
         private double _responseMs;
@@ -75,6 +78,7 @@ namespace M10Modbus
         private InstrumentView? _instrument;
         private string? _lastValidTare;
         private M10PollResult? _lastReading;
+        private bool _exchangeEstablished;
 
         public DeviceCardModel(int deviceNumber)
         {
@@ -103,10 +107,11 @@ namespace M10Modbus
             Endpoint = M10ModbusClient.FormatEndpoint(s.Ip.Trim(), s.Port);
             _latchEnabled = latchEnabled; _latched = false; _rechecking = false;
             _faults = _clean = _failures = 0; _heldMask = 0;
-            _ok = _errors = 0; _lastSuccess = null; _lastEventKey = ""; _overrun = false;
+            _ok = _errors = 0; _lastEventKey = ""; _overrun = false;
             _deviceInfo = ""; _connectionError = ""; _requiresOperatorAction = false; _configurationWarning = "";
             _lastValidTare = null;
             _lastReading = null;
+            _exchangeEstablished = false;
             Phase = CardPhase.Connecting;
             string timing = periodMs.HasValue && timeoutMs.HasValue ? $"; период {periodMs} мс, таймаут {timeoutMs} мс" : "";
             var events = new List<CardEvent>
@@ -131,7 +136,8 @@ namespace M10Modbus
         {
             if (Phase == CardPhase.Off) return Array.Empty<CardEvent>();
             var events = new List<CardEvent>();
-            void Event(string text, Tone tone) => events.Add(new CardEvent(r.Timestamp, text, tone));
+            void Event(string text, Tone tone) => events.Add(new CardEvent(r.Timestamp, text, tone)
+                { ExchangeId = r.ExchangeId, TransactionId = r.TransactionId });
 
             if (!r.IsConnected)
             {
@@ -139,15 +145,14 @@ namespace M10Modbus
                 _connectionError = r.ConnectionError;
                 _requiresOperatorAction = r.RequiresOperatorAction;
                 Phase = CardPhase.CommError;
+                _exchangeEstablished = false;
                 if (_failures == 1 || _failures % 10 == 0)
                     Event($"{(r.RequiresOperatorAction ? "Опрос приостановлен" : "Ошибка обмена")} #{_failures}: {r.ConnectionError}", Tone.Bad);
                 View = BuildView();
                 return events;
             }
 
-            if (_failures > 0 || _lastSuccess == null)
-                Event(_failures > 0 ? "Обмен восстановлен; конфигурация прочитана заново." : $"Обмен установлен; {r.DeviceInfo}.", Tone.Good);
-            _failures = 0; _ok++; _lastSuccess = r.Timestamp;
+            _failures = 0; _ok++;
             Phase = CardPhase.Live;
             if (r.ConfigurationWarning != _configurationWarning)
             {
@@ -184,6 +189,15 @@ namespace M10Modbus
             _snapshot = new Snapshot(_weightText, _weightIsMessage, _stateText, r.Timestamp, _instrument);
             View = BuildView();
             return events;
+        }
+
+        public IReadOnlyList<CardEvent> ApplyIdentification(CardEvent identified)
+        {
+            if (Phase == CardPhase.Off || _exchangeEstablished) return Array.Empty<CardEvent>();
+            _exchangeEstablished = true;
+            return new[] { _failures > 0
+                ? identified with { Text = identified.Text.Replace("Обмен установлен", "Обмен восстановлен") }
+                : identified };
         }
 
         private void ApplyWeight(M10PollResult r, Action<string, Tone> Event)

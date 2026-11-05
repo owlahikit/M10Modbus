@@ -10,12 +10,35 @@ namespace M10Modbus
     {
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
-        public const string Legend = "Обозначения: № — номер транзакции Modbus TCP (одинаков в запросе и ответе); " +
+        public const string Legend = "Обозначения: число перед временем — общий номер транзакции журнала для обоих приборов (одинаков в TX, RX и расшифровке); " +
             "Id — адрес устройства (Unit Identifier, 7-й байт, как адрес в RTU); FC — код функции (hex); " +
             "адрес и регистров — dec (hex), адреса как в документе, без смещения −1; " +
-            "HEX: 6 байт TCP-префикса (№, протокол 0, длина) → Id + PDU (= кадр RTU без CRC); " +
+            "HEX: 6 байт TCP-префикса (номер транзакции, протокол 0, длина) → Id + PDU (= кадр RTU без CRC); " +
+            "реальный номер Modbus — первые 2 байта HEX, он не обязан совпадать с номером журнала; " +
             "«период» — от предыдущего TX показаний этого прибора; «ответ через» — от отправки TX до последнего байта ответа; " +
             "инициализация (1000, 1100…) идёт подряд без периода.";
+
+        public static string WithJournalNumber(string text, long number)
+        {
+            int separator = text.IndexOf(": ", StringComparison.Ordinal);
+            if (separator < 0 || !ushort.TryParse(text.AsSpan(0, separator), NumberStyles.None, Inv, out _))
+                throw new ArgumentException("Ожидался номер транзакции перед временем.", nameof(text));
+            string label = number.ToString(Inv);
+            string[] lines = text.Split('\n');
+            lines[0] = label + lines[0][separator..];
+            int delta = label.Length - separator;
+            for (int i = 1; i < lines.Length; i++)
+            {
+                if (delta >= 0) lines[i] = new string(' ', delta) + lines[i];
+                else
+                {
+                    int remove = 0;
+                    while (remove < -delta && remove < lines[i].Length && lines[i][remove] == ' ') remove++;
+                    lines[i] = lines[i][remove..];
+                }
+            }
+            return string.Join("\n", lines);
+        }
 
         /// <summary>"HH:mm:ss.fff [Прибор N] " or "HH:mm:ss.fff [Система] ".</summary>
         public static string Prefix(DateTime time, int device) =>
@@ -43,6 +66,7 @@ namespace M10Modbus
         public static (string Text, TraceTone Tone) Format(ModbusTrace t, int device)
         {
             string prefix = device > 0 || t.Endpoint.Length == 0 ? Prefix(t.Timestamp, device) : Prefix(t.Timestamp, t.Endpoint);
+            prefix = $"{t.TransactionId}: " + prefix;
             (string description, TraceTone tone) = t.Direction == "TX" ? DescribeTx(t) : DescribeRx(t);
             string text = prefix + description;
             if (t.Bytes.Length > 0)
@@ -53,7 +77,7 @@ namespace M10Modbus
         private static (string, TraceTone) DescribeTx(ModbusTrace t)
         {
             byte fc = t.Bytes.Length > 7 ? t.Bytes[7] : (byte)3;
-            string text = $"TX №{t.TransactionId} Id={t.UnitId} FC={fc:X2} адрес={t.StartAddress} (0x{t.StartAddress:X4}) " +
+            string text = $"TX Id={t.UnitId} FC={fc:X2} адрес={t.StartAddress} (0x{t.StartAddress:X4}) " +
                 $"регистров={t.RegisterCount} (0x{t.RegisterCount:X4}) · ";
             switch (t.Phase)
             {
@@ -71,18 +95,19 @@ namespace M10Modbus
         private static (string, TraceTone) DescribeRx(ModbusTrace t)
         {
             byte[] b = t.Bytes;
-            string request = $" · на запрос №{t.TransactionId}";
+            int? receivedId = b.Length >= 2 ? (b[0] << 8) | b[1] : null;
+            string request = receivedId.HasValue && receivedId != t.TransactionId ? $" · номер ответа={receivedId}" : "";
             if (!t.IsComplete)
             {
                 string head = b.Length == 0 ? "RX НЕТ ОТВЕТА"
-                    : "RX НЕПОЛНЫЙ" + (b.Length >= 2 ? $" №{(b[0] << 8) | b[1]}" : "") +
+                    : "RX НЕПОЛНЫЙ" +
                       (t.ExpectedLength.HasValue ? $" получено {b.Length} из {t.ExpectedLength.Value} байт" : $" получено {b.Length} байт (длина неизвестна)");
                 string aborted = t.ResponseMs.HasValue ? $" · прервано через {FormatMs(t.ResponseMs.Value)} мс" : " · прервано";
                 return (head + request + aborted + (t.Note.Length > 0 ? ": " + t.Note : ""), TraceTone.Error);
             }
 
             string answered = t.ResponseMs.HasValue ? $" · ответ через {FormatMs(t.ResponseMs.Value)} мс" : "";
-            string text = "RX" + (b.Length >= 2 ? $" №{(b[0] << 8) | b[1]}" : "") + (b.Length > 6 ? $" Id={b[6]}" : "");
+            string text = "RX" + (b.Length > 6 ? $" Id={b[6]}" : "");
             if (b.Length <= 7) return (text + request + answered, TraceTone.Rx);
             byte fc = b[7];
             text += $" FC={fc:X2}";
@@ -102,13 +127,15 @@ namespace M10Modbus
             Math.Abs(ms - Math.Round(ms)) < 1e-9 ? Math.Round(ms).ToString("F0", Inv) : FormatMs(ms);
 
         /// <summary>Decoded current-weight line (or the exchange error) of one poll result.</summary>
-        public static (string Text, bool IsError) FormatData(M10PollResult r, int device)
+        public static (string Text, bool IsError) FormatData(M10PollResult r, int device, bool rawValues = false)
         {
+            string Number(float value) => rawValues ? value.ToString("G9", Inv) : M10PollResult.FormatNumber(value, Inv);
             string prefix = Prefix(r.Timestamp, device);
-            if (!r.IsConnected) return (prefix + "Ошибка обмена: " + r.ConnectionError, true);
+            if (!r.IsConnected) return ((r.ExchangeId != Guid.Empty ? $"{r.TransactionId}: " : "") +
+                prefix + "Ошибка обмена: " + r.ConnectionError, true);
             string text = $"{r.TransactionId}: {prefix}Весы {r.ScaleNumber}: " +
-                $"Брутто={r.Brutto.ToString("G9", Inv)} Нетто={r.Netto.ToString("G9", Inv)} " +
-                $"Тара={r.Tare.ToString("G9", Inv)} {r.Unit} d={r.Division.ToString("G9", Inv)} | " +
+                $"Брутто={Number(r.Brutto)} Нетто={Number(r.Netto)} " +
+                $"Тара={Number(r.Tare)} {r.Unit} d={Number(r.Division)} | " +
                 $"Диапазон={r.Range} | Stable={(r.IsStable ? 1 : 0)} Zero={(r.IsZero ? 1 : 0)} " +
                 $"BelowMin={(r.IsBelowMinimum ? 1 : 0)} | {r.GetMetrologicalErrorDescription()}";
             return (text, r.HasScaleError || !r.HasValidWeight);
@@ -127,10 +154,10 @@ namespace M10Modbus
                 return null;
             var words = new ushort[count];
             for (int i = 0; i < count; i++) words[i] = (ushort)((b[9 + 2 * i] << 8) | b[10 + 2 * i]);
-            string prefix = Prefix(t.Timestamp, device);
+            string prefix = $"{t.TransactionId}: " + Prefix(t.Timestamp, device);
             if (t.Phase == TracePhase.Identification)
             {
-                string text = prefix + $"Идентификация №{t.TransactionId} | Тип={words[0]} ({(words[0] == 100 ? "M10" : "неизвестный")}) | SN={words[1]}";
+                string text = prefix + $"Идентификация | Тип={words[0]} ({(words[0] == 100 ? "M10" : "неизвестный")}) | SN={words[1]}";
                 if (words[8] > 1)
                     return (text + $" | Endians={words[8]}: неизвестный порядок слов, FW и DT не расшифрованы", true);
                 bool lowWordFirst = words[8] == 1;
@@ -138,8 +165,8 @@ namespace M10Modbus
                 text += $" | FW={firmware >> 16}.{firmware & 0xFFFF:D3}" +
                     $" | DT_Current={M10ModbusClient.DecodeUInt32(words, 4, lowWordFirst)} | DT_Boot={M10ModbusClient.DecodeUInt32(words, 6, lowWordFirst)}" +
                     $" | Endians={words[8]} ({(lowWordFirst ? "младшее" : "старшее")} слово первым)";
-                bool invalid = words[0] != 100 || (firmware >> 16) != 1;
-                return (text + (invalid ? " | НЕКОРРЕКТНО: неподдерживаемый тип или версия протокола" : ""), invalid);
+                bool invalid = words[0] != 100;
+                return (text + (invalid ? " | НЕКОРРЕКТНО: ожидался M10 (100)" : ""), invalid);
             }
 
             string unit = words[1] switch { 0 => "кг", 1 => "т", _ => "неизвестная" };
@@ -147,7 +174,7 @@ namespace M10Modbus
             {
                 0 => "однодиапазонные", 1 => "многоинтервальные", 2 => "многодиапазонные", _ => "неизвестный"
             };
-            var config = new StringBuilder(prefix + $"Конфигурация №{t.TransactionId} · Весы {t.ScaleNumber}" +
+            var config = new StringBuilder(prefix + $"Конфигурация · Весы {t.ScaleNumber}" +
                 $" | SN весов={words[0]} | Единица={words[1]} ({unit}) | Тип диапазонов={words[2]} ({rangeType}) | Диапазонов={words[3]}");
             bool invalidConfig = words[1] > 1 || words[2] > 2 || words[3] < 1 || words[3] > 3;
             if (words[3] is >= 1 and <= 3)
@@ -158,7 +185,7 @@ namespace M10Modbus
                     float min = M10ModbusClient.DecodeFloat(words, offset, t.LowWordFirst);
                     float max = M10ModbusClient.DecodeFloat(words, offset + 2, t.LowWordFirst);
                     float d = M10ModbusClient.DecodeFloat(words, offset + 4, t.LowWordFirst);
-                    config.Append($" | Диапазон {i + 1}: Min={min.ToString("G9", Inv)} Max={max.ToString("G9", Inv)} d={d.ToString("G9", Inv)}");
+                    config.Append($" | Диапазон {i + 1}: Min={M10PollResult.FormatNumber(min, Inv)} Max={M10PollResult.FormatNumber(max, Inv)} d={M10PollResult.FormatNumber(d, Inv)}");
                     invalidConfig |= !float.IsFinite(min) || !float.IsFinite(max) || !float.IsFinite(d) ||
                         min < 0 || max < min || d <= 0;
                 }

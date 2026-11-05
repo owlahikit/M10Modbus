@@ -52,9 +52,14 @@ public class DeviceCardModelTests
         Assert.Equal(("—", Tone.Stale), (m.View.WeightText, m.View.WeightTone));
         Assert.Equal(("Ожидание первого ответа", Tone.Neutral), (m.View.StateText, m.View.StateTone));
 
+        var identified = new CardEvent(T0.AddMilliseconds(-20), "Обмен установлен; M10 SN 1.", Tone.Good)
+            { ExchangeId = Guid.NewGuid(), TransactionId = 1 };
+        Assert.Equal(identified, Assert.Single(m.ApplyIdentification(identified)));
+        Assert.Equal(CardPhase.Connecting, m.Phase);
+        Assert.Empty(m.ApplyIdentification(identified));
         var r = Ok(T0);
         var events = m.Apply(r);
-        Assert.Contains(events, e => e.Text == "Обмен установлен; M10 SN 1." && e.Time == T0);
+        Assert.DoesNotContain(events, e => e.Text.Contains("Обмен установлен"));
         Assert.Equal("Подключено · ответ 21:47:35.703 за 26 мс · ответов 1 · сбоев 0", m.View.StatusText);
         Assert.Equal(Tone.Good, m.View.StatusTone);
         Assert.Equal(Weight(r), m.View.WeightText);
@@ -112,8 +117,9 @@ public class DeviceCardModelTests
         Assert.Equal(("Ошибка обмена: нет ответа", Tone.Bad), (m.View.StateText, m.View.StateTone));
 
         var r = Ok(T0.AddSeconds(1));
-        var restored = m.Apply(r);
-        Assert.Contains(restored, e => e.Text == "Обмен восстановлен; конфигурация прочитана заново.");
+        var restored = m.ApplyIdentification(new CardEvent(T0, "Обмен установлен; M10 SN 1.", Tone.Good));
+        Assert.Contains(restored, e => e.Text == "Обмен восстановлен; M10 SN 1.");
+        Assert.DoesNotContain(m.Apply(r), e => e.Text.Contains("Обмен восстановлен"));
         var events = new List<CardEvent>();
         for (int i = 1; i <= 20; i++) events.AddRange(m.Apply(Fail(T0.AddSeconds(1 + i))));
         Assert.Equal(new[] { "Ошибка обмена #1: нет ответа", "Ошибка обмена #10: нет ответа", "Ошибка обмена #20: нет ответа" },
@@ -123,6 +129,22 @@ public class DeviceCardModelTests
         Assert.Equal(Weight(r), v.WeightText);
         Assert.Equal(Tone.Stale, v.WeightTone);
         Assert.Equal(Tone.Bad, v.StateTone);
+    }
+
+    [Fact]
+    public void Events_LinkToTheReading_AndStoppedModelIgnoresIdentification()
+    {
+        var model = Started(false);
+        var reading = Ok(T0);
+        reading.ExchangeId = Guid.NewGuid();
+        reading.TransactionId = 0; // A valid wrapped Modbus transaction.
+        Assert.All(model.Apply(reading), e =>
+        {
+            Assert.Equal(reading.ExchangeId, e.ExchangeId);
+            Assert.Equal(reading.TransactionId, e.TransactionId);
+        });
+        model.Stop(T0, "оператором");
+        Assert.Empty(model.ApplyIdentification(new CardEvent(T0, "Обмен установлен; M10 SN 1.", Tone.Good)));
     }
 
     [Fact]
